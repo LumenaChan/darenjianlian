@@ -14,10 +14,13 @@ const navGroups = [
 const creatorNav = ["工作台", "达人库", "达人采集", "建联管理", "历史达人分析", "定向链接自动化"];
 
 const taskSeed = [
-  { id: 1, tone: "danger", title: "定向链接执行异常", meta: "8 条任务等待处理", action: "去处理" },
-  { id: 2, tone: "warning", title: "抓取任务部分失败", meta: "蝉妈妈 · 直播达人 · 32 条失败", action: "查看原因" },
-  { id: 3, tone: "brand", title: "待分配达人较多", meta: "126 位达人进入待分配清单", action: "去分配" },
-  { id: 4, tone: "neutral", title: "建联状态长时间未更新", meta: "3 个批次超过 3 天未更新", action: "去跟进" },
+  { id: 1, tone: "danger", title: "定向链接执行异常", meta: "8 个自动化任务异常", action: "去处理", view: "定向链接自动化", filter: "任务状态 = 异常" },
+  { id: 2, tone: "danger", title: "达人采集任务失败", meta: "3 个采集任务执行失败", action: "去处理", view: "达人采集", filter: "状态 = 执行失败" },
+  { id: 3, tone: "warning", title: "达人采集异常", meta: "2 个采集任务存在失败数据", action: "去处理", view: "达人采集", filter: "状态 = 部分失败" },
+  { id: 4, tone: "warning", title: "建联状态长期未更新", meta: "15 个达人超过 3 天未更新状态", action: "去处理", view: "建联管理", filter: "状态 = 沟通中 · 更新时间超过3天" },
+  { id: 5, tone: "brand", title: "待处理达人回复", meta: "23 个达人等待商务跟进", action: "去处理", view: "建联管理", filter: "状态 = 已回复" },
+  { id: 6, tone: "brand", title: "合作意向待处理", meta: "8 个达人等待确认", action: "去处理", view: "建联管理", filter: "状态 = 达成合作意向" },
+  { id: 7, tone: "neutral", title: "待分配达人较多", meta: "126 个达人等待分配", action: "去处理", view: "达人库", filter: "建联状态 = 未分配" },
 ];
 
 const batches = [
@@ -86,7 +89,30 @@ Object.values(outreachRecords).forEach((task) => {
   if (legacy && processStages.includes(legacy as OutreachProcessStage)) task.processStage = legacy as OutreachProcessStage;
   if (legacy === "达成意向" || legacy === "未达成") task.finalResult = legacy;
   if (!task.processStage && task.assignedAt) task.processStage = task.repliedAt ? "已回复" : task.agreedAt ? "已同意" : task.addedAt ? "已添加" : "已分配";
+  delete (task as OutreachRecord & { product?: string }).product;
 });
+
+type SharedOutreachTask = {
+  taskId: string;
+  creatorId: string;
+  batchId: string;
+  owner: string;
+  processStage?: OutreachProcessStage;
+  finalResult?: OutreachFinalResult;
+  createdAt: string;
+  updatedAt: string;
+  assignedBy: string;
+};
+
+// 统一建联任务数据源：页面只从这份任务主档派生当前状态和历史记录。
+let sharedOutreachTasks: SharedOutreachTask[] = Object.entries(outreachRecords)
+  .filter(([, task]) => getTaskSummary(task) !== "未建联" && task.taskId)
+  .map(([creatorId, task]) => ({ taskId: task.taskId!, creatorId, batchId: task.batch ?? "—", owner: task.owner ?? "—", processStage: task.processStage, finalResult: task.finalResult, createdAt: task.assignedAt ?? "—", updatedAt: task.repliedAt ?? task.agreedAt ?? task.addedAt ?? task.assignedAt ?? "—", assignedBy: task.assignedBy ?? "—" }));
+
+function publishSharedOutreachTasks(tasks: SharedOutreachTask[]) {
+  sharedOutreachTasks = tasks;
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("outreach-tasks-updated"));
+}
 
 // 达人归属为单选。命中更高优先级采集时，覆盖旧归属和旧采集信息：竞品达人 > 直播达人 > 短视频达人。
 const creatorRelationProfiles: Record<string, { type: "短视频" | "直播" | "竞品达人"; acquisitionSource: string; competitorStores: string[] }> = {
@@ -141,6 +167,69 @@ const creatorRows = creators.map((creator, index) => ({
   createdAt: index === 0 ? "2026-06-01 20:11" : "2026-06-01 10:00",
 }));
 
+type CollectionCreatorType = "短视频达人" | "直播达人" | "竞品达人";
+const creatorTypePriority: Record<CollectionCreatorType, number> = { "短视频达人": 1, "直播达人": 2, "竞品达人": 3 };
+
+function normalizeCreatorType(type?: string): CollectionCreatorType {
+  if (type?.includes("竞品")) return "竞品达人";
+  if (type?.includes("直播")) return "直播达人";
+  return "短视频达人";
+}
+
+/** 采集入库统一使用此方法计算达人主档归属，避免不同入口各自覆盖类型。 */
+function resolveCreatorType(existingType: string | undefined, incomingType: string): CollectionCreatorType {
+  const existing = normalizeCreatorType(existingType);
+  const incoming = normalizeCreatorType(incomingType);
+  return creatorTypePriority[incoming] > creatorTypePriority[existing] ? incoming : existing;
+}
+
+function toLibraryCreatorType(type: CollectionCreatorType): "短视频" | "直播" | "竞品达人" {
+  return type === "短视频达人" ? "短视频" : type === "直播达人" ? "直播" : "竞品达人";
+}
+
+/** 模拟一次采集结果逐条写入达人库：平台+UID命中则更新并追加来源历史，否则创建主档。 */
+function ingestCollectionResults(task: { id: string; type: string; source: string; config: string }) {
+  const incomingType = normalizeCreatorType(task.type);
+  const sourceType = `${incomingType}抓取`;
+  const sourceObject = `${task.config} · ${task.source}`;
+  const samples = [
+    { platform: "抖音", uid: "dy_86541972" },
+    { platform: "抖音", uid: `dy_${task.id.slice(-5)}` },
+  ];
+  samples.forEach(({ platform, uid }) => {
+    const existing = creatorRows.find((creator) => creator.platform === platform && creator.uid === uid);
+    const collectedAt = "刚刚";
+    if (existing) {
+      const resolvedType = resolveCreatorType(existing.type, incomingType);
+      existing.type = toLibraryCreatorType(resolvedType);
+      existing.source = task.source;
+      existing.acquisitionSource = sourceType;
+      existing.update = collectedAt;
+      creatorAcquisitionHistory[existing.id] ??= [];
+      creatorAcquisitionHistory[existing.id].unshift({ collectedAt, sourceType, sourceObject, taskId: task.id });
+      return;
+    }
+    const template = creatorRows[0];
+    const id = `c_collection_${task.id}_${uid}`;
+    creatorRows.push({
+      ...template,
+      id,
+      name: `新采集达人 ${uid.replace("dy_", "")}`,
+      uid,
+      initials: "新",
+      type: toLibraryCreatorType(resolveCreatorType(undefined, incomingType)),
+      source: task.source,
+      update: collectedAt,
+      contactStatus: "未建联",
+      outreach: undefined,
+      acquisitionSource: sourceType,
+      competitorStores: [],
+      platform,
+    });
+    creatorAcquisitionHistory[id] = [{ collectedAt, sourceType, sourceObject, taskId: task.id }];
+  });
+}
+
 export default function Home() {
   const [collapsed, setCollapsed] = useState(false);
   const [currentView, setCurrentView] = useState("工作台");
@@ -152,15 +241,15 @@ export default function Home() {
   const [layerMetric, setLayerMetric] = useState<"成交金额" | "达人数量">("成交金额");
 
   const metrics = useMemo(() => period === 7 ? [
-    { label: "唯一达人总数", value: "128,642", detail: "按平台 + 达人UID去重 · 较上周 +4,286", trend: "+3.4%", icon: "达", color: "violet" },
-    { label: "今日采集命中", value: "3,589", detail: "新增主档 1,183 · 更新已有主档 2,406", trend: "+12.6%", icon: "新", color: "cyan" },
-    { label: "待分配达人", value: "126", detail: "来自 4 个筛选清单", trend: "需处理", icon: "分", color: "orange" },
-    { label: "链接异常任务", value: "8", detail: "参数异常 3 · 执行失败 5", trend: "较昨日 -3", icon: "链", color: "red" },
+    { label: "累计达人资产", value: "128,642", detail: "截至当前平台累计沉淀的去重达人数量", trend: "累计", icon: "达", color: "violet" },
+    { label: "今日新增达人", value: "3,589", detail: "今日通过达人采集新增进入达人库的达人数量", trend: "今日", icon: "新", color: "cyan" },
+    { label: "待分配达人", value: "126", detail: "当前未创建建联任务的达人数量", trend: "需处理", icon: "分", color: "orange" },
+    { label: "定向链接异常", value: "8", detail: "当前需要处理的自动化执行异常任务数量", trend: "需处理", icon: "链", color: "red" },
   ] : [
-    { label: "唯一达人总数", value: "128,642", detail: "按平台 + 达人UID去重 · 近30天 +18,620", trend: "+16.9%", icon: "达", color: "violet" },
-    { label: "本月采集命中", value: "42,138", detail: "新增主档 18,620 · 其余合并更新", trend: "+21.4%", icon: "新", color: "cyan" },
-    { label: "待分配达人", value: "126", detail: "来自 4 个筛选清单", trend: "需处理", icon: "分", color: "orange" },
-    { label: "链接异常任务", value: "8", detail: "本月累计已处理 42 条", trend: "解决率 84%", icon: "链", color: "red" },
+    { label: "累计达人资产", value: "128,642", detail: "截至当前平台累计沉淀的去重达人数量", trend: "累计", icon: "达", color: "violet" },
+    { label: "今日新增达人", value: "3,589", detail: "今日通过达人采集新增进入达人库的达人数量", trend: "今日", icon: "新", color: "cyan" },
+    { label: "待分配达人", value: "126", detail: "当前未创建建联任务的达人数量", trend: "需处理", icon: "分", color: "orange" },
+    { label: "定向链接异常", value: "8", detail: "当前需要处理的自动化执行异常任务数量", trend: "需处理", icon: "链", color: "red" },
   ], [period]);
 
   const funnelComparison = useMemo(() => period === 7 ? [
@@ -183,7 +272,23 @@ export default function Home() {
       { label: "头部", value: "47", percentage: 1.1 }, { label: "肩部", value: "738", percentage: 17.2 }, { label: "中腰部", value: "1,286", percentage: 30.0 }, { label: "腰部", value: "982", percentage: 22.9 }, { label: "小达人", value: "846", percentage: 19.7 }, { label: "尾部达人", value: "389", percentage: 9.1 },
     ];
     return layerMetric === "成交金额" ? amount : count;
-  }, [layerMetric, period]);
+  }, [layerMetric]);
+
+  const businessExecution = useMemo(() => period === 7 ? [
+    { owner: "陈小雨", assigned: 120, replied: 48, intent: 12 },
+    { owner: "林晓婷", assigned: 98, replied: 36, intent: 9 },
+    { owner: "张文豪", assigned: 86, replied: 31, intent: 7 },
+  ] : [
+    { owner: "陈小雨", assigned: 486, replied: 196, intent: 52 },
+    { owner: "林晓婷", assigned: 402, replied: 158, intent: 41 },
+    { owner: "张文豪", assigned: 368, replied: 142, intent: 35 },
+  ], [period]);
+
+  useEffect(() => {
+    const panel = document.querySelector<HTMLElement>(".activity-panel");
+    if (!panel) return;
+    panel.innerHTML = `<div class="panel-head"><div><h2>商务执行情况</h2><p>统计周期：${period === 7 ? "近7天" : "近30天"}</p></div></div><div class="business-execution-table"><div class="business-execution-head"><span>商务</span><span>建联人数</span><span>回复人数</span><span>合作意向</span></div>${businessExecution.map((item) => `<div class="business-execution-row"><strong>${item.owner}</strong><span>${item.assigned}</span><span>${item.replied}</span><span>${item.intent}</span></div>`).join("")}</div>`;
+  }, [businessExecution, period]);
 
   function notify(message: string, tone: NonNullable<Toast>["tone"] = "default") {
     setToast({ message, tone });
@@ -194,6 +299,11 @@ export default function Home() {
     const target = tasks.find((task) => task.id === id);
     setTasks((current) => current.filter((task) => task.id !== id));
     notify(`${target?.title ?? "待办"}已进入处理流程`, "success");
+  }
+
+  function openTodo(task: typeof taskSeed[number]) {
+    setCurrentView(task.view);
+    notify(`已进入${task.view}，自动筛选：${task.filter}`, "success");
   }
 
   return (
@@ -239,17 +349,17 @@ export default function Home() {
         </header>
 
         <div className="context-row">
-          <div className="date-chip"><span>今天</span> 2026年8月18日 · 星期二</div><div className="refresh-note">数据更新于 {refreshed}</div>
-          <div className="period-switch" aria-label="统计周期"><button aria-pressed={period === 7} className={period === 7 ? "active" : ""} onClick={() => setPeriod(7)}>近7天</button><button aria-pressed={period === 30} className={period === 30 ? "active" : ""} onClick={() => setPeriod(30)}>近30天</button></div>
+          <div className="date-chip" aria-label="当前日期"><span>今天</span> 2026年8月18日 · 星期二</div><div className="refresh-note">数据更新于 {refreshed}</div>
+          <div className="period-switch" aria-label="周期筛选"><button aria-pressed={period === 7} className={period === 7 ? "active" : ""} onClick={() => setPeriod(7)}>近7天</button><button aria-pressed={period === 30} className={period === 30 ? "active" : ""} onClick={() => setPeriod(30)}>近30天</button></div>
         </div>
 
         <section className="metric-grid" aria-label="核心指标">
-          {metrics.map((metric) => <article className="metric-card" key={metric.label}><div className={`metric-icon ${metric.color}`}>{metric.icon}</div><div className="metric-main"><span>{metric.label}</span><strong>{metric.value}</strong><small>{metric.detail}</small></div><span className={`metric-trend ${metric.color}`}>{metric.trend}</span></article>)}
+          {metrics.map((metric) => <article className="metric-card" key={metric.label} title={metric.label === "累计达人资产" ? "平台累计去重达人数量" : metric.label === "今日新增达人" ? "当天新增进入达人库的达人数量" : metric.label === "待分配达人" ? "当前未创建建联任务的达人数量" : "当前需要处理的自动化执行异常任务数量"}><div className={`metric-icon ${metric.color}`}>{metric.icon}</div><div className="metric-main"><span>{metric.label}</span><strong>{metric.value}</strong><small>{metric.detail}</small></div><span className={`metric-trend ${metric.color}`}>{metric.trend}</span></article>)}
         </section>
 
         <section className="dashboard-grid top-grid">
           <article className="panel funnel-panel">
-            <div className="panel-head"><div><h2>建联转化漏斗</h2><p>本周期内进入建联流程的达人节点转化情况</p></div><button className="text-button" onClick={() => setCurrentView("建联管理")}>查看全部 <span>→</span></button></div>
+            <div className="panel-head"><div><h2>建联转化漏斗</h2><p>统计周期：{period === 7 ? "近7天" : "近30天"}<br/><span>统计创建建联任务后的达人转化情况；进入建联 = 创建建联任务的达人数量。</span></p></div><button className="text-button" onClick={() => setCurrentView("建联管理")}>查看全部 <span>→</span></button></div>
             <div className="funnel-summary">
               <div><strong>{period === 7 ? "1,268" : "5,486"}</strong><span>进入建联</span></div><i>→</i>
               <div><strong>{period === 7 ? "943" : "4,102"}</strong><span>已添加</span><small>74.4%</small></div><i>→</i>
@@ -268,7 +378,7 @@ export default function Home() {
 
           <article className="panel todo-panel">
             <div className="panel-head"><div><h2>今日待办</h2><p>优先处理会阻塞业务进度的事项</p></div><span className="count-badge">{tasks.length}</span></div>
-            <div className="todo-list">{tasks.length ? tasks.map((task) => <div className="todo-item" key={task.id}><span className={`todo-signal ${task.tone}`} /><div><strong>{task.title}</strong><small>{task.meta}</small></div><button onClick={() => finishTask(task.id)}>{task.action}</button></div>) : <div className="empty-state"><span>✓</span><strong>今日待办已处理完成</strong><small>新的异常或任务会出现在这里</small></div>}</div>
+            <div className="todo-list">{tasks.length ? tasks.map((task) => <div className="todo-item" key={task.id}><span className={`todo-signal ${task.tone}`} /><div><strong>{task.title}</strong><small>{task.meta}</small></div><button onClick={() => openTodo(task)}>{task.action}</button></div>) : <div className="empty-state"><span>✓</span><strong>今日待办已处理完成</strong><small>新的异常或任务会出现在这里</small></div>}</div>
           </article>
         </section>
 
@@ -327,7 +437,7 @@ function CreatorLibrary({ notify, onBack }: { notify: (message: string, tone?: N
   const [historyTaskDetail, setHistoryTaskDetail] = useState<OutreachRecord | null>(null);
   const [detailTab, setDetailTab] = useState<"overview" | "relations" | "history">("overview");
   const [unreachedOpen, setUnreachedOpen] = useState(false);
-  const [outreachOverrides, setOutreachOverrides] = useState<Record<string, Partial<OutreachRecord>>>({});
+  const [outreachOverrides, setOutreachOverrides] = useState<Record<string, Partial<OutreachRecord>>>(() => Object.fromEntries(sharedOutreachTasks.map((task) => [task.creatorId, { processStage: task.processStage, finalResult: task.finalResult, stage: task.finalResult ?? task.processStage, taskId: task.taskId, assignedAt: task.createdAt, assignedBy: task.assignedBy, owner: task.owner, batch: task.batchId, addedAt: task.processStage && ["已添加", "已同意", "已回复"].includes(task.processStage) ? task.updatedAt : undefined, agreedAt: task.processStage && ["已同意", "已回复"].includes(task.processStage) ? task.updatedAt : undefined, repliedAt: task.processStage === "已回复" ? task.updatedAt : undefined }])));
   const pageSize = 5;
   const competitorStores = Object.fromEntries(creatorRows.filter((creator) => creator.competitorStores.length).map((creator) => [creator.id, creator.competitorStores])) as Record<string, string[]>;
   const competitorStoreOptions = Array.from(new Set(Object.values(competitorStores).flat()));
@@ -797,7 +907,7 @@ function CreatorLibrary({ notify, onBack }: { notify: (message: string, tone?: N
   }, [categoryFilter, competitorStoreFilter, creatorType, followersFilter, historyFilter, minScore, productCountFilter, settlementFilter, showAdvanced, sourceFilter, storeCountFilter, updateFilter]);
 
   function resetPage() { setPage(1); }
-  function changeCreatorType(type: "短视频" | "直播" | "竞品达人") { setCreatorType(type); setCompetitorStoreFilter("全部竞品店铺"); resetPage(); }
+  function changeCreatorType(type: "短视频" | "直播" | "竞品达人") { setCreatorType(type); setSelected([]); setCompetitorStoreFilter("全部竞品店铺"); resetPage(); }
 
   useEffect(() => {
     if (!detailCreator) return;
@@ -851,6 +961,13 @@ function CreatorLibrary({ notify, onBack }: { notify: (message: string, tone?: N
   function confirmAssignment() {
     // 待分配池是暂存选择；提交时必须按当前建联状态重新校验，避免选中后被其他商务建联而重复分配。
     const selectedCreators = selected.map((id) => creatorRows.find((creator) => creator.id === id)).filter((creator): creator is typeof creatorRows[number] => Boolean(creator));
+    const expectedType = creatorType === "短视频" ? "短视频达人" : creatorType === "直播" ? "直播达人" : "竞品达人";
+    const mixedTypeCreators = selectedCreators.filter((creator) => creator.type !== expectedType);
+    if (mixedTypeCreators.length) {
+      notify(`当前批次只能包含${expectedType}，请拆分后分别创建批次`, "warning");
+      setSelected((current) => current.filter((id) => !mixedTypeCreators.some((creator) => creator.id === id)));
+      return;
+    }
     const activeConflicts = selectedCreators.filter(hasActiveOutreachTask);
     const otherBlocked = selectedCreators.filter((creator) => !canAssignCreator(creator) && !hasActiveOutreachTask(creator));
     const blockedIds = new Set([...activeConflicts, ...otherBlocked].map((creator) => creator.id));
@@ -870,10 +987,19 @@ function CreatorLibrary({ notify, onBack }: { notify: (message: string, tone?: N
       notify("待分配池中暂无可分配达人", "warning");
       return;
     }
+    const batchId = `FP20260820${String(sharedOutreachTasks.length + 1).padStart(3, "0")}`;
+    const createdAt = "今天 14:20";
+    const newTasks: SharedOutreachTask[] = selectedCreators.map((creator, index) => ({ taskId: `CT20260820${String(sharedOutreachTasks.length + index + 1).padStart(3, "0")}`, creatorId: creator.id, batchId, owner: "陈小雨", processStage: "已分配", createdAt, updatedAt: createdAt, assignedBy: "陈旭光" }));
+    publishSharedOutreachTasks([...sharedOutreachTasks, ...newTasks]);
+    setOutreachOverrides((current) => {
+      const next = { ...current };
+      selectedCreators.forEach((creator, index) => { next[creator.id] = { processStage: "已分配", stage: "已分配", taskId: newTasks[index].taskId, assignedAt: createdAt, assignedBy: "陈旭光", owner: "陈小雨", batch: batchId, batchSize: selectedCreators.length, batchCreatedAt: createdAt, addedAt: undefined, agreedAt: undefined, repliedAt: undefined, intentAt: undefined, finalResult: undefined }; });
+      return next;
+    });
     setAssignOpen(false);
     setAssignConflictNames([]);
     setSelected([]);
-    notify("分配批次已创建，并已生成建联任务", "success");
+    notify(`已创建分配批次 ${batchId}，并生成 ${newTasks.length} 条建联任务`, "success");
   }
 
   function confirmReassignment() {
@@ -885,6 +1011,8 @@ function CreatorLibrary({ notify, onBack }: { notify: (message: string, tone?: N
       return;
     }
     const taskId = `CT20260820${reassignCreator.id.replace("c", "").padStart(4, "0")}R`;
+    const reassignedTask: SharedOutreachTask = { taskId, creatorId: reassignCreator.id, batchId: "FP20260820001", owner: "陈小雨", processStage: "已分配", createdAt: "今天 14:20", updatedAt: "今天 14:20", assignedBy: "陈旭光" };
+    publishSharedOutreachTasks([...sharedOutreachTasks, reassignedTask]);
     setOutreachTaskHistory((current) => ({ ...current, [reassignCreator.id]: [...(current[reassignCreator.id] ?? []), previousTask] }));
     setOutreachOverrides((current) => ({
       ...current,
@@ -976,6 +1104,8 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
   const [dailyTimes, setDailyTimes] = useState(["08:00"]);
   const [weeklySchedules, setWeeklySchedules] = useState([{ day: "周一", time: "09:00" }]);
   const [taskFilter, setTaskFilter] = useState("全部");
+  const [configPage, setConfigPage] = useState(1);
+  const [collectionTaskPage, setCollectionTaskPage] = useState(1);
   const [detailTask, setDetailTask] = useState<string | null>(null);
   const [rerunConfirmTaskId, setRerunConfirmTaskId] = useState<string | null>(null);
   const [configs, setConfigs] = useState([
@@ -1027,6 +1157,9 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
   // 手动执行的配置不生成待执行实例，只有用户点击“立即执行”时才创建执行任务。
   const visibleTasks = tasks.filter((task) => taskFilter === "全部" || task.status === taskFilter);
   const currentTask = tasks.find((task) => task.id === detailTask) ?? null;
+
+  useEffect(() => { setConfigPage(1); }, [configs.length]);
+  useEffect(() => { setCollectionTaskPage(1); }, [taskFilter, tasks.length]);
 
   useEffect(() => {
     const stats = document.querySelectorAll<HTMLElement>(".collection-stat-grid article");
@@ -1152,6 +1285,53 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
       header.insertBefore(cell, header.lastElementChild);
     }
   }, [tab, tasks, taskFilter]);
+
+  useEffect(() => {
+    if (tab !== "configs") return;
+    const list = document.querySelector<HTMLElement>(".config-list");
+    if (!list) return;
+    const pageSize = 3;
+    const cards = Array.from(list.querySelectorAll<HTMLElement>(":scope > .config-card"));
+    const pageCount = Math.max(1, Math.ceil(cards.length / pageSize));
+    const activePage = Math.min(configPage, pageCount);
+    if (activePage !== configPage) { setConfigPage(activePage); return; }
+    cards.forEach((card, index) => { card.hidden = index < (activePage - 1) * pageSize || index >= activePage * pageSize; });
+    list.parentElement?.querySelector("[data-collection-config-pagination]")?.remove();
+    const pager = document.createElement("div");
+    pager.dataset.collectionConfigPagination = "true";
+    pager.className = "collection-pagination";
+    pager.innerHTML = `<span>显示 ${cards.length ? (activePage - 1) * pageSize + 1 : 0}–${Math.min(activePage * pageSize, cards.length)} 条，共 ${cards.length} 条</span><div><button type="button" data-page="prev" ${activePage === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pageCount }, (_, index) => `<button type="button" data-page="${index + 1}" class="${activePage === index + 1 ? "active" : ""}">${index + 1}</button>`).join("")}<button type="button" data-page="next" ${activePage === pageCount ? "disabled" : ""}>›</button></div>`;
+    pager.querySelectorAll<HTMLButtonElement>("[data-page]").forEach((button) => button.addEventListener("click", () => {
+      const target = button.dataset.page;
+      setConfigPage(target === "prev" ? Math.max(1, activePage - 1) : target === "next" ? Math.min(pageCount, activePage + 1) : Number(target));
+    }));
+    list.insertAdjacentElement("afterend", pager);
+    return () => pager.remove();
+  }, [tab, configs, configPage]);
+
+  useEffect(() => {
+    if (tab !== "tasks") return;
+    const view = document.querySelector<HTMLElement>(".task-view");
+    const table = view?.querySelector<HTMLElement>(".task-table table");
+    if (!view || !table) return;
+    const pageSize = 5;
+    const rows = Array.from(table.querySelectorAll<HTMLTableRowElement>("tbody tr"));
+    const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+    const activePage = Math.min(collectionTaskPage, pageCount);
+    if (activePage !== collectionTaskPage) { setCollectionTaskPage(activePage); return; }
+    rows.forEach((row, index) => { row.hidden = index < (activePage - 1) * pageSize || index >= activePage * pageSize; });
+    view.querySelector("[data-collection-task-pagination]")?.remove();
+    const pager = document.createElement("div");
+    pager.dataset.collectionTaskPagination = "true";
+    pager.className = "collection-pagination";
+    pager.innerHTML = `<span>显示 ${rows.length ? (activePage - 1) * pageSize + 1 : 0}–${Math.min(activePage * pageSize, rows.length)} 条，共 ${rows.length} 条</span><div><button type="button" data-page="prev" ${activePage === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pageCount }, (_, index) => `<button type="button" data-page="${index + 1}" class="${activePage === index + 1 ? "active" : ""}">${index + 1}</button>`).join("")}<button type="button" data-page="next" ${activePage === pageCount ? "disabled" : ""}>›</button></div>`;
+    pager.querySelectorAll<HTMLButtonElement>("[data-page]").forEach((button) => button.addEventListener("click", () => {
+      const target = button.dataset.page;
+      setCollectionTaskPage(target === "prev" ? Math.max(1, activePage - 1) : target === "next" ? Math.min(pageCount, activePage + 1) : Number(target));
+    }));
+    view.querySelector(".task-table")?.insertAdjacentElement("afterend", pager);
+    return () => pager.remove();
+  }, [tab, tasks, taskFilter, collectionTaskPage]);
 
   useEffect(() => {
     if (!currentTask) return;
@@ -1369,9 +1549,18 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
     setEditingConfigId(config.id);
     setConfigNameTouched(true);
     setConfigType(config.type as typeof configType);
+    setTimeRange(config.timeRange);
     setCompetitorStores(config.competitorStores ?? []);
     setCompetitorStoreText("");
-    setLiveGmvValue(config.liveGmv.replace(/[^0-9.]/g, ""));
+    const parseGmv = (value: string) => value.startsWith("≥")
+      ? { operator: "大于等于" as const, amount: value.replace(/[^0-9.]/g, "") }
+      : { operator: "不限" as const, amount: "" };
+    const videoGmv = parseGmv(config.videoGmv);
+    const liveGmv = parseGmv(config.liveGmv);
+    setVideoGmvOperator(videoGmv.operator);
+    setVideoGmvValue(videoGmv.amount);
+    setLiveGmvOperator(liveGmv.operator);
+    setLiveGmvValue(liveGmv.amount);
     const weeklyMatches = Array.from(config.frequency.matchAll(/(周[一二三四五六日])\s+(\d{2}:\d{2})/g)).map((match) => ({ day: match[1], time: match[2] }));
     const dailyMatches = Array.from(config.frequency.matchAll(/\d{2}:\d{2}/g));
     if (weeklyMatches.length) {
@@ -1435,7 +1624,8 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
     if (!config) return;
     // “立即执行”只创建一条新的任务实例，不修改配置，也不复用配置上的执行结果。
     // 抓取不等待整条任务结束：每个成功批次立刻按“平台 + 达人UID”写入或合并更新达人主档。
-    const task = { id: `CT20260818${String(tasks.length + 27).padStart(3, "0")}`, configId: config.id, type: config.type, config: config.name, source: config.source, plannedAt: "今天 10:35（立即执行）", actualStartedAt: "刚刚", start: "刚刚", result: "正在获取达人数据，已实时写入首批结果", addedCount: 72, updatedCount: 164, failed: 0, status: "执行中", timeRange: config.timeRange, creatorTypes: config.creatorTypes, creatorType: config.creatorTypes.join("、"), videoGmv: config.videoGmv, liveGmv: config.liveGmv, frequency: config.frequency, competitorStores: config.competitorStores };
+    const task = { id: `CT20260818${String(tasks.length + 27).padStart(3, "0")}`, configId: config.id, type: config.type, config: config.name, source: config.source, plannedAt: "今天 10:35（立即执行）", actualStartedAt: "刚刚", start: "刚刚", result: "正在获取达人数据，已实时写入首批结果", addedCount: 72, updatedCount: 164, failed: 0, status: "执行中", executionRecords: [{ attempt: 1, plannedAt: "今天 10:35（立即执行）", startedAt: "刚刚", status: "执行中", result: "正在获取达人数据，已实时写入首批结果", added: 72, updated: 164, failed: 0 }], timeRange: config.timeRange, creatorTypes: config.creatorTypes, creatorType: config.creatorTypes.join("、"), videoGmv: config.videoGmv, liveGmv: config.liveGmv, frequency: config.frequency, competitorStores: config.competitorStores };
+    ingestCollectionResults(task);
     setTasks((current) => [task, ...current]);
     setTab("tasks");
     notify("抓取任务已创建，命中更高优先级类型时将迁移达人归属并覆盖采集信息", "success");
@@ -1446,6 +1636,8 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
   }
 
   function retryCollectionTask(taskId: string) {
+    const sourceTask = tasks.find((task) => task.id === taskId);
+    if (sourceTask) ingestCollectionResults(sourceTask);
     setTasks((current) => current.map((task) => {
       if (task.id !== taskId) return task;
       const attempt = (task.executionRecords?.length ?? 0) + 1;
@@ -1459,19 +1651,43 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
 
   function startCollectionTask(taskId: string) {
     // 进入执行中即模拟首批成功结果入库，之后停止或部分失败都只影响未处理数据，不撤回这里的成功结果。
-    setTasks((current) => current.map((task) => task.id === taskId ? { ...task, status: "执行中", actualStartedAt: "刚刚", endedAt: "—", start: "刚刚", result: "已提前执行，首批结果已实时写入达人库", addedCount: 68, updatedCount: 142, executionRecords: (task.executionRecords ?? []).map((record, index, records) => index === records.length - 1 ? { ...record, startedAt: "刚刚", status: "执行中", result: "已提前执行，首批结果已实时写入达人库", added: 68, updated: 142 } : record) } : task));
+    const sourceTask = tasks.find((task) => task.id === taskId);
+    if (sourceTask) ingestCollectionResults(sourceTask);
+    setTasks((current) => current.map((task) => {
+      if (task.id !== taskId) return task;
+      const records = task.executionRecords ?? [];
+      const last = records[records.length - 1];
+      const isRestart = task.status === "已停止";
+      const attempt = records.reduce((max, record) => Math.max(max, record.attempt), 0) + (isRestart ? 1 : 0);
+      const nextRecord = { attempt: isRestart ? attempt : (last?.attempt ?? 1), plannedAt: last?.plannedAt ?? task.start, startedAt: "刚刚", status: "执行中", result: "已提前执行，首批结果已实时写入达人库", added: 68, updated: 142, failed: 0 };
+      // 首次执行只推进第1条计划记录；停止后重新启动则追加新的执行次数，旧记录不变。
+      const nextRecords = isRestart || !last ? [...records, nextRecord] : [...records.slice(0, -1), nextRecord];
+      return { ...task, status: "执行中", actualStartedAt: "刚刚", endedAt: "—", start: "刚刚", result: nextRecord.result, addedCount: 68, updatedCount: 142, executionRecords: nextRecords };
+    }));
     notify("已提前执行抓取任务，正在同步执行状态", "success");
   }
 
   function stopCollectionTask(taskId: string) {
     if (tasks.find((task) => task.id === taskId)?.status !== "执行中") { notify("只有执行中的任务可以停止", "warning"); return; }
-    setTasks((current) => current.map((task) => task.id === taskId ? { ...task, status: "已停止", endedAt: "刚刚", result: "本次抓取已由主管停止，已成功处理的数据保留", executionRecords: (task.executionRecords ?? []).map((record, index, records) => index === records.length - 1 ? { ...record, status: "已停止", result: "执行中被主管停止，已成功处理的数据保留", added: task.addedCount ?? record.added, updated: task.updatedCount ?? record.updated } : record) } : task));
+    setTasks((current) => current.map((task) => {
+      if (task.id !== taskId) return task;
+      const records = task.executionRecords ?? [];
+      const last = records[records.length - 1];
+      const stoppedRecord = { ...(last ?? { attempt: 1, plannedAt: task.start, startedAt: "刚刚", added: task.addedCount ?? 0, updated: task.updatedCount ?? 0, failed: task.failed ?? 0 }), status: "已停止", result: "执行中被主管停止，已成功处理的数据保留", added: task.addedCount ?? last?.added ?? 0, updated: task.updatedCount ?? last?.updated ?? 0 };
+      return { ...task, status: "已停止", endedAt: "刚刚", result: stoppedRecord.result, executionRecords: [...records, stoppedRecord] };
+    }));
     notify("抓取任务已停止；停止前成功处理的数据已保留在达人库", "success");
   }
 
   function cancelCollectionTask(taskId: string) {
     if (tasks.find((task) => task.id === taskId)?.status !== "待执行") { notify("只有待执行任务可以取消", "warning"); return; }
-    setTasks((current) => current.map((task) => task.id === taskId ? { ...task, status: "已取消", actualStartedAt: "—", addedCount: 0, updatedCount: 0, failed: 0, result: "任务在开始执行前已取消，未产生抓取结果", executionRecords: (task.executionRecords ?? []).map((record, index, records) => index === records.length - 1 ? { ...record, status: "已取消", result: "任务在开始执行前已取消，未产生抓取结果", added: 0, updated: 0, failed: 0 } : record) } : task));
+    setTasks((current) => current.map((task) => {
+      if (task.id !== taskId) return task;
+      const records = task.executionRecords ?? [];
+      const last = records[records.length - 1];
+      const cancelledRecord = { ...(last ?? { attempt: 1, plannedAt: task.start, startedAt: "—" }), status: "已取消", result: "任务在开始执行前已取消，未产生抓取结果", added: 0, updated: 0, failed: 0 };
+      return { ...task, status: "已取消", actualStartedAt: "—", addedCount: 0, updatedCount: 0, failed: 0, result: cancelledRecord.result, executionRecords: [...records, cancelledRecord] };
+    }));
     notify("待执行抓取任务已取消，未产生任何抓取结果", "success");
   }
 
@@ -1522,21 +1738,28 @@ function CreatorCollection({ notify, onBack }: { notify: (message: string, tone?
 function ContactManagement({ notify, onBack }: { notify: (message: string, tone?: NonNullable<Toast>["tone"]) => void; onBack: () => void }) {
   const [view, setView] = useState<"tasks" | "batches">("tasks");
   const [statusFilter, setStatusFilter] = useState("全部");
+  const [contactTaskPage, setContactTaskPage] = useState(1);
+  const [batchPage, setBatchPage] = useState(1);
   const [selected, setSelected] = useState<string[]>([]);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchDetailId, setBatchDetailId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [importReady, setImportReady] = useState(false);
+  const [importValidated, setImportValidated] = useState(false);
   const [importHistoryOpen, setImportHistoryOpen] = useState(false);
+  const [importExceptionsOpen, setImportExceptionsOpen] = useState(false);
   const [importRecordId, setImportRecordId] = useState<string | null>(null);
-  const [importRecords, setImportRecords] = useState([{ id: "IR20260818001", file: "商务回填表 · FP20260818007.xlsx", batch: "FP20260818007", operator: "陈旭光", importedAt: "2026-08-18 17:32", total: 120, updated: 2, status: "已完成" }]);
+
+  const [importRecords, setImportRecords] = useState([{ id: "IR20260818001", file: "商务回填表 · FP20260818007.xlsx", batch: "FP20260818007", operator: "陈旭光", importedAt: "2026-08-18 17:32", total: 120, updated: 115, success: 115, skipped: 5, unchanged: 20, status: "已完成" }]);
+  const importExceptions = [{ id: "EX20260818001", file: "商务回填表 · FP20260818007.xlsx", batch: "FP20260818007", count: 5, reason: "2 条缺少建联任务编号，3 条状态字段格式异常", status: "待处理" }];
   const [statusUpdateOpen, setStatusUpdateOpen] = useState(false);
   const [statusUpdater, setStatusUpdater] = useState("");
   const [statusOccurredAt, setStatusOccurredAt] = useState("");
   const [statusNext, setStatusNext] = useState("");
   const [statusUpdateNote, setStatusUpdateNote] = useState("");
-  const [statusUpdates, setStatusUpdates] = useState<Record<string, { status: string; updater: string; occurredAt: string; note: string }>>({});
+  const [statusConfirmation, setStatusConfirmation] = useState<{ updater: string; occurredAt: string; nextStatus: string; note: string; reason: string } | null>(null);
+  const [statusUpdates, setStatusUpdates] = useState<Record<string, { status: string; updater: string; occurredAt: string; note: string; reason?: string }>>({});
   const [tasks, setTasks] = useState([
     { id: "BL202608180321", creator: "小家电研究所", uid: "dy_86541972", avatar: "blue", product: "创维循环扇", owner: "陈小雨", batch: "FP20260818007", added: "是", agreed: "否", replied: "否", intent: "否", status: "已添加待同意", updated: "今天 10:12" },
     { id: "BL202608180320", creator: "洁净生活家", uid: "dy_10376294", avatar: "pink", product: "创维循环扇", owner: "陈小雨", batch: "FP20260818007", added: "是", agreed: "是", replied: "是", intent: "是", status: "已达成合作意向", updated: "今天 09:58" },
@@ -1546,10 +1769,11 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     { id: "BL202608170286", creator: "阿阳测评", uid: "dy_42917835", avatar: "green", product: "苏泊尔空气炸锅", owner: "张文豪", batch: "FP20260817012", added: "是", agreed: "否", replied: "否", intent: "否", status: "未达成", updated: "昨天 16:18" },
   ]);
   const batches = [
-    { id: "FP20260818007", product: "创维循环扇", owner: "陈小雨", type: "短视频 + 直播", count: 120, added: 86, agreed: 48, replied: 31, intent: 12, created: "今天 09:15" },
-    { id: "FP20260818006", product: "小熊破壁机", owner: "林晓婷", type: "短视频达人", count: 80, added: 72, agreed: 42, replied: 28, intent: 9, created: "今天 08:42" },
-    { id: "FP20260817012", product: "苏泊尔空气炸锅", owner: "张文豪", type: "直播达人", count: 150, added: 146, agreed: 91, replied: 63, intent: 21, created: "昨天 16:05" },
+    { id: "FP20260818007", product: "创维循环扇", owner: "陈小雨", type: "短视频达人", count: 120, added: 86, agreed: 48, replied: 31, intent: 12, unreached: 20, created: "今天 09:15" },
+    { id: "FP20260818006", product: "小熊破壁机", owner: "林晓婷", type: "短视频达人", count: 80, added: 72, agreed: 42, replied: 28, intent: 9, unreached: 12, created: "今天 08:42" },
+    { id: "FP20260817012", product: "苏泊尔空气炸锅", owner: "张文豪", type: "直播达人", count: 150, added: 146, agreed: 91, replied: 63, intent: 21, unreached: 18, created: "昨天 16:05" },
   ];
+  batches.forEach((batch) => { delete (batch as typeof batch & { product?: string }).product; });
   const statusTabs = ["全部", "待添加", "已添加待同意", "已同意待回复", "沟通中", "已达成合作意向", "未达成"];
   const visibleTasks = tasks.filter((task) => statusFilter === "全部" || task.status === statusFilter);
   const detail = tasks.find((task) => task.id === detailId) ?? null;
@@ -1558,6 +1782,121 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
   const importRecord = importRecords.find((record) => record.id === importRecordId) ?? null;
   const allSelected = visibleTasks.length > 0 && visibleTasks.every((task) => selected.includes(task.id));
   const statusTimeMax = new Date().toISOString().slice(0, 16);
+
+  useEffect(() => {
+    const syncSharedTasks = () => {
+      setTasks((current) => {
+        const existing = new Set(current.map((task) => task.id));
+        const additions = sharedOutreachTasks.filter((task) => !existing.has(task.taskId)).map((task) => ({ id: task.taskId, creator: task.creatorId, uid: task.creatorId, avatar: "blue", owner: task.owner, batch: task.batchId, added: "否", agreed: "否", replied: "否", intent: "否", status: task.processStage ?? "已分配", updated: task.updatedAt }));
+        return additions.length ? [...additions, ...current] : current;
+      });
+    };
+    window.addEventListener("outreach-tasks-updated", syncSharedTasks);
+    syncSharedTasks();
+    return () => window.removeEventListener("outreach-tasks-updated", syncSharedTasks);
+  }, []);
+
+  useEffect(() => {
+    setTasks((current) => current.map((task) => {
+      const sanitized = { ...task } as typeof task & { product?: string; productId?: string };
+      delete sanitized.product;
+      delete sanitized.productId;
+      return sanitized;
+    }));
+  }, []);
+
+  useEffect(() => { setContactTaskPage(1); }, [statusFilter, tasks.length]);
+  useEffect(() => { if (view === "batches") setBatchPage(1); }, [view]);
+
+  useEffect(() => {
+    if (view !== "tasks") return;
+    const total = document.querySelector<HTMLElement>(".contact-toolbar > span");
+    if (total) total.innerHTML = `共 <strong>${visibleTasks.length}</strong> 条任务`;
+  }, [view, visibleTasks.length]);
+
+  useEffect(() => {
+    if (!importRecord) return;
+    const drawer = document.querySelector<HTMLElement>(".contact-detail-drawer[aria-label='导入记录详情']");
+    if (!drawer) return;
+    const info = Array.from(drawer.querySelectorAll<HTMLElement>(".detail-section")).find((section) => section.querySelector("h3")?.textContent === "导入信息");
+    const grid = info?.querySelector<HTMLElement>(".task-detail-grid");
+    grid?.querySelector("[data-import-stats]")?.remove();
+    if (grid) {
+      const stats = document.createElement("div");
+      stats.dataset.importStats = "true";
+      stats.innerHTML = `<small>导入结果</small><strong>成功更新 ${importRecord.success ?? importRecord.updated} · 异常跳过 ${importRecord.skipped ?? 0} · 无变化 ${importRecord.unchanged ?? 0}</strong>`;
+      grid.append(stats);
+    }
+    const result = Array.from(drawer.querySelectorAll<HTMLElement>(".detail-section")).find((section) => section.querySelector("h3")?.textContent === "回写结果");
+    if (result) result.innerHTML = `<h3>导入结果统计</h3><div class="import-result-summary"><div><small>总人数</small><strong>${importRecord.total}</strong></div><div><small>成功更新</small><strong class="success">${importRecord.success ?? importRecord.updated}</strong></div><div><small>异常跳过</small><strong class="warning">${importRecord.skipped ?? 0}</strong></div><div><small>无变化</small><strong>${importRecord.unchanged ?? 0}</strong></div></div><div class="import-outcome-detail"><p><strong>成功记录</strong>${importRecord.success ?? importRecord.updated} 条已按任务编号完成状态更新。</p><p><strong>异常记录</strong>${importRecord.skipped ?? 0} 条已跳过，未影响成功数据。</p><p><strong>异常原因</strong>任务编号缺失、无法匹配或状态字段格式异常。</p></div><p>正常数据已覆盖更新；异常数据已进入异常记录，后续可单独核查。</p>`;
+  }, [importRecord]);
+
+  useEffect(() => {
+    if (!importHistoryOpen) return;
+    const records = Array.from(document.querySelectorAll<HTMLElement>(".import-record-list > button"));
+    records.forEach((button, index) => {
+      const record = importRecords[index];
+      if (!record) return;
+      button.querySelector("[data-import-record-meta]")?.remove();
+      const meta = document.createElement("div");
+      meta.dataset.importRecordMeta = "true";
+      meta.className = "import-record-meta";
+      meta.innerHTML = `<span>批次 ${record.batch}</span><span>总 ${record.total}</span><span class="success">成功 ${record.success ?? record.updated}</span><span class="warning">异常 ${record.skipped ?? 0}</span><span>无变化 ${record.unchanged ?? 0}</span>`;
+      button.querySelector("div")?.append(meta);
+    });
+  }, [importHistoryOpen, importRecords]);
+
+  useEffect(() => {
+    if (!importOpen) { setImportValidated(false); return; }
+    const modal = document.querySelector<HTMLElement>(".import-modal");
+    const action = modal?.querySelector<HTMLButtonElement>("footer .primary-button");
+    const body = modal?.querySelector<HTMLElement>(".import-modal-body");
+    if (!modal || !action || !body) return;
+    action.textContent = importValidated ? "确认导入" : "解析并校验";
+    body.querySelector("[data-import-validation-preview]")?.remove();
+    if (importReady) {
+      const preview = document.createElement("div");
+      preview.dataset.importValidationPreview = "true";
+      preview.className = `import-validation-preview ${importValidated ? "validated" : ""}`;
+      preview.innerHTML = `<h3>${importValidated ? "校验结果" : "待校验数据"}</h3><div><span>总数据<strong>120</strong></span><span>可更新<strong class="success">115</strong></span><span>异常<strong class="warning">5</strong></span><span>无变化<strong>20</strong></span></div><p>${importValidated ? "校验完成，请确认后更新建联状态。异常数据将跳过，不影响正常数据。" : "点击“解析并校验”后查看导入数据检查结果。"}</p>`;
+      body.insertBefore(preview, body.querySelector(".import-fields"));
+    }
+    if (importValidated || !importReady) return;
+    const intercept = (event: Event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setImportValidated(true);
+      notify("Excel 已解析，校验结果已生成，请确认导入", "success");
+    };
+    action.addEventListener("click", intercept, true);
+    return () => action.removeEventListener("click", intercept, true);
+  }, [importOpen, importReady, importValidated]);
+
+  useEffect(() => {
+    const tableSelector = view === "tasks" ? ".contact-table table" : ".batch-table table";
+    const table = document.querySelector<HTMLElement>(tableSelector);
+    if (!table) return;
+    const pageSize = view === "tasks" ? 5 : 2;
+    const rows = Array.from(table.querySelectorAll<HTMLTableRowElement>("tbody tr"));
+    const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+    const currentPage = view === "tasks" ? contactTaskPage : batchPage;
+    const setPage = view === "tasks" ? setContactTaskPage : setBatchPage;
+    const activePage = Math.min(currentPage, pageCount);
+    if (activePage !== currentPage) { setPage(activePage); return; }
+    rows.forEach((row, index) => { row.hidden = index < (activePage - 1) * pageSize || index >= activePage * pageSize; });
+    const panel = table.closest<HTMLElement>(".contact-panel");
+    panel?.querySelector("[data-contact-pagination]")?.remove();
+    const pager = document.createElement("div");
+    pager.dataset.contactPagination = "true";
+    pager.className = "collection-pagination contact-pagination";
+    pager.innerHTML = `<span>显示 ${rows.length ? (activePage - 1) * pageSize + 1 : 0}–${Math.min(activePage * pageSize, rows.length)} 条，共 ${rows.length} 条</span><div><button type="button" data-page="prev" ${activePage === 1 ? "disabled" : ""}>‹</button>${Array.from({ length: pageCount }, (_, index) => `<button type="button" data-page="${index + 1}" class="${activePage === index + 1 ? "active" : ""}">${index + 1}</button>`).join("")}<button type="button" data-page="next" ${activePage === pageCount ? "disabled" : ""}>›</button></div>`;
+    pager.querySelectorAll<HTMLButtonElement>("[data-page]").forEach((button) => button.addEventListener("click", () => {
+      const target = button.dataset.page;
+      setPage(target === "prev" ? Math.max(1, activePage - 1) : target === "next" ? Math.min(pageCount, activePage + 1) : Number(target));
+    }));
+    table.closest<HTMLElement>(".table-wrap")?.insertAdjacentElement("afterend", pager);
+    return () => pager.remove();
+  }, [view, visibleTasks, batches, contactTaskPage, batchPage]);
 
   useEffect(() => {
     const pageDescription = document.querySelector<HTMLElement>(".contact-head p");
@@ -1587,9 +1926,14 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
 
   // 建联分配以“达人 × 商务 × 批次”为主，不在任务与批次视图重复展示商品信息。
   useEffect(() => {
-    const removeColumn = (selector: string, index: number) => document.querySelectorAll<HTMLTableRowElement>(`${selector} tr`).forEach((row) => row.children[index]?.remove());
-    if (view === "tasks") removeColumn(".contact-table", 3);
-    if (view === "batches") removeColumn(".batch-table", 1);
+    const removeColumnByName = (selector: string, label: string) => {
+      const table = document.querySelector<HTMLElement>(`${selector} table`);
+      const header = Array.from(table?.querySelectorAll<HTMLTableCellElement>("thead th") ?? []).find((cell) => cell.textContent === label);
+      const index = header ? Array.from(header.parentElement?.children ?? []).indexOf(header) : -1;
+      if (index >= 0) table?.querySelectorAll<HTMLTableRowElement>("tr").forEach((row) => row.children[index]?.remove());
+    };
+    if (view === "tasks") removeColumnByName(".contact-table", "推广商品");
+    if (view === "batches") removeColumnByName(".batch-table", "推广商品");
 
     const removeDetailField = (label: string) => document.querySelectorAll<HTMLElement>(`.contact-detail-drawer[aria-label="${label}"] .task-detail-grid > div`).forEach((item) => {
       if (item.querySelector("small")?.textContent === "推广商品") item.remove();
@@ -1608,6 +1952,15 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
       if (item.childNodes[0]?.textContent === "推广商品") item.remove();
     });
   }, [batchDetail, batchOpen, detail, view]);
+
+  useEffect(() => {
+    if (view !== "tasks") return;
+    const table = document.querySelector<HTMLElement>(".contact-table table");
+    const checkboxHeader = Array.from(table?.querySelectorAll<HTMLTableCellElement>("thead th") ?? []).find((cell) => Boolean(cell.querySelector("input[type=checkbox]")));
+    const checkboxIndex = checkboxHeader ? Array.from(checkboxHeader.parentElement?.children ?? []).indexOf(checkboxHeader) : -1;
+    if (checkboxIndex >= 0) table?.querySelectorAll<HTMLTableRowElement>("tr").forEach((row) => row.children[checkboxIndex]?.remove());
+    document.querySelector<HTMLElement>(".contact-toolbar > label")?.remove();
+  }, [view, visibleTasks.length, contactTaskPage]);
 
   useEffect(() => {
     if (view !== "batches") return;
@@ -1646,13 +1999,22 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     const progressSection = Array.from(drawer?.querySelectorAll<HTMLElement>(":scope > .detail-section") ?? []).find((section) => section.querySelector("h3")?.textContent === "建联进度");
     if (!drawer || !progressSection) return;
 
+    drawer.querySelector("[data-batch-funnel]")?.remove();
+    const pendingCount = batchDetail.count - batchDetail.added;
+    const funnel = document.createElement("section");
+    funnel.dataset.batchFunnel = "true";
+    funnel.className = "detail-section batch-funnel-section";
+    funnel.innerHTML = `<h3>建联进度漏斗</h3><div class="batch-funnel"><div class="batch-funnel-step"><strong>${batchDetail.count}</strong><span>总人数</span></div><i>↓</i><div class="batch-funnel-step"><strong>${batchDetail.added}</strong><span>已添加</span></div><i>↓</i><div class="batch-funnel-step"><strong>${batchDetail.agreed}</strong><span>已同意</span></div><i>↓</i><div class="batch-funnel-step"><strong>${batchDetail.replied}</strong><span>已回复</span></div><i>↓</i><div class="batch-funnel-step emphasis"><strong>${batchDetail.intent}</strong><span>达成合作意向</span></div></div><div class="batch-funnel-outcomes"><div><small>未达成</small><strong>${batchDetail.unreached ?? 0}</strong></div><div><small>待跟进</small><strong>${pendingCount}</strong></div></div>`;
+    drawer.querySelector(".batch-detail-hero")?.insertAdjacentElement("afterend", funnel);
+
     const names = ["小家电研究所", "洁净生活家", "懒人厨房", "暖暖的居家日记", "家居好物直播间", "阿阳测评", "乐妈家居直播", "收纳研究员", "极简生活实验室", "小鹿的家", "家电观察员", "居家好物笔记"];
+    const unreachedCount = batchDetail.unreached ?? 0;
     const members = Array.from({ length: batchDetail.count }, (_, index) => {
       const rank = index + 1;
       const status = rank <= batchDetail.intent ? "达成意向" : rank <= batchDetail.replied ? "已回复" : rank <= batchDetail.agreed ? "已同意" : rank <= batchDetail.added ? "已添加" : "待添加";
-      return { name: rank <= names.length ? names[rank - 1] : `${batchDetail.type.replace("达人", "")}达人 ${String(rank).padStart(3, "0")}`, uid: `dy_${String(86541972 + rank * 173).padStart(8, "0")}`, status, updated: status === "待添加" ? "等待商务处理" : `今天 ${String(8 + (rank % 10)).padStart(2, "0")}:${String(10 + (rank * 7) % 50).padStart(2, "0")}` };
+      return { name: rank <= names.length ? names[rank - 1] : `${batchDetail.type.replace("达人", "")}达人 ${String(rank).padStart(3, "0")}`, uid: `dy_${String(86541972 + rank * 173).padStart(8, "0")}`, status, finalResult: rank > batchDetail.count - unreachedCount ? "未达成" : undefined, updated: status === "待添加" ? "等待商务处理" : `今天 ${String(8 + (rank % 10)).padStart(2, "0")}:${String(10 + (rank * 7) % 50).padStart(2, "0")}` };
     });
-    const counts: Record<string, number> = { "全部": batchDetail.count, "已添加": batchDetail.added, "已同意": batchDetail.agreed, "已回复": batchDetail.replied, "达成意向": batchDetail.intent, "待添加": batchDetail.count - batchDetail.added };
+    const counts: Record<string, number> = { "全部": batchDetail.count, "待添加": batchDetail.count - batchDetail.added, "已添加": batchDetail.added, "已同意": batchDetail.agreed, "已回复": batchDetail.replied, "达成意向": batchDetail.intent, "未达成": unreachedCount };
     let activeFilter = "全部";
     let currentPage = 1;
     const pageSize = 10;
@@ -1661,15 +2023,22 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     listSection.className = "detail-section batch-member-list";
 
     const renderMembers = () => {
-      const filtered = activeFilter === "全部" ? members : members.filter((member) => member.status === activeFilter);
+      const filtered = activeFilter === "全部" ? members : activeFilter === "未达成" ? members.filter((member) => member.finalResult === "未达成") : members.filter((member) => member.status === activeFilter);
       const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
       currentPage = Math.min(currentPage, totalPages);
       const displayed = filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-      listSection.innerHTML = `<h3>${activeFilter === "全部" ? "批次内达人" : `${activeFilter}达人`}</h3><p>共 ${filtered.length} 位达人${activeFilter === "全部" ? "，已完整纳入本批次" : "，来自当前进度状态"}。</p><div class="batch-member-filters">${Object.entries(counts).map(([label, count]) => `<button type="button" data-batch-member-filter="${label}" class="${activeFilter === label ? "active" : ""}">${label} <strong>${count}</strong></button>`).join("")}</div><div class="batch-member-table"><div class="batch-member-head"><span>达人</span><span>达人UID</span><span>当前进度</span><span>最近更新</span></div>${displayed.map((member) => `<div class="batch-member-row"><strong>${member.name}</strong><code>${member.uid}</code><span class="batch-member-status ${member.status === "达成意向" ? "success" : member.status === "待添加" ? "pending" : ""}">${member.status}</span><small>${member.updated}</small></div>`).join("")}</div><div class="batch-member-pagination"><span>显示 ${filtered.length ? (currentPage - 1) * pageSize + 1 : 0}–${Math.min(currentPage * pageSize, filtered.length)} 位，共 ${filtered.length} 位</span><div><button type="button" data-batch-member-page="prev" ${currentPage === 1 ? "disabled" : ""}>‹</button><b>${currentPage} / ${totalPages}</b><button type="button" data-batch-member-page="next" ${currentPage === totalPages ? "disabled" : ""}>›</button></div></div>`;
+      listSection.innerHTML = `<h3>${activeFilter === "全部" ? "批次内达人" : `${activeFilter}达人`}</h3><p>共 ${filtered.length} 位达人${activeFilter === "全部" ? "，已完整纳入本批次" : "，来自当前进度状态"}。</p><div class="batch-member-filters">${Object.entries(counts).map(([label, count]) => `<button type="button" data-batch-member-filter="${label}" class="${activeFilter === label ? "active" : ""}">${label} <strong>${count}</strong></button>`).join("")}</div><div class="batch-member-table"><div class="batch-member-head"><span>达人</span><span>达人UID</span><span>当前进度</span><span>最终结果</span><span>最近更新</span></div>${displayed.map((member) => `<div class="batch-member-row"><strong>${member.name}</strong><code>${member.uid}</code><span class="batch-member-status ${member.status === "达成意向" ? "success" : member.status === "待添加" ? "pending" : ""}">${member.status}</span><span class="batch-member-final ${member.finalResult === "未达成" ? "failed" : ""}">${member.finalResult ?? "—"}</span><small>${member.updated}</small></div>`).join("")}</div><div class="batch-member-pagination"><span>显示 ${filtered.length ? (currentPage - 1) * pageSize + 1 : 0}–${Math.min(currentPage * pageSize, filtered.length)} 位，共 ${filtered.length} 位</span><div><button type="button" data-batch-member-page="prev" ${currentPage === 1 ? "disabled" : ""}>‹</button><b>${currentPage} / ${totalPages}</b><button type="button" data-batch-member-page="next" ${currentPage === totalPages ? "disabled" : ""}>›</button></div></div>`;
       listSection.querySelectorAll<HTMLButtonElement>("[data-batch-member-filter]").forEach((button) => button.onclick = () => { activeFilter = button.dataset.batchMemberFilter ?? "全部"; currentPage = 1; renderMembers(); });
       listSection.querySelector<HTMLButtonElement>("[data-batch-member-page='prev']")?.addEventListener("click", () => { currentPage--; renderMembers(); });
       listSection.querySelector<HTMLButtonElement>("[data-batch-member-page='next']")?.addEventListener("click", () => { currentPage++; renderMembers(); });
     };
+    const progressList = progressSection.querySelector<HTMLElement>(".batch-progress-list");
+    if (progressList && !progressList.querySelector("[data-unreached-progress]")) {
+      const item = document.createElement("div");
+      item.dataset.unreachedProgress = "true";
+      item.innerHTML = `<span>未达成</span><strong>${unreachedCount} / ${batchDetail.count}</strong>`;
+      progressList.append(item);
+    }
     progressSection.querySelectorAll<HTMLElement>(".batch-progress-list > div").forEach((item) => {
       const label = item.querySelector("span")?.textContent ?? "";
       item.classList.add("batch-progress-drilldown");
@@ -1688,7 +2057,7 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     const cardData = [
       { className: "flow-export", label: "待导出回填表", value: "2", description: "2 个批次等待下发给商务", action: "去导出", onClick: () => { setView("batches"); notify("请在批次操作列逐批导出回填表"); } },
       { className: "flow-collect", label: "已下发待跟进", value: "3", description: "其中 17 条任务已超 3 天未更新", action: "查看超时", onClick: () => { setStatusFilter("全部"); setView("tasks"); notify("已筛选需关注任务"); } },
-      { className: "flow-import", label: "导入异常待处理", value: "1", description: "1 份已上传回填表存在字段校验异常", action: "查看记录", onClick: () => setImportHistoryOpen(true) },
+      { className: "flow-import", label: "导入异常待处理", value: String(importExceptions.length), description: `${importExceptions.length} 份已上传回填表存在字段校验异常`, action: "查看异常", onClick: () => setImportExceptionsOpen(true) },
       { className: "flow-result", label: "本周达成意向", value: "89", description: "较上周提升 4.8%，可进入合作准备" },
     ];
     cards.forEach((card, index) => {
@@ -1698,6 +2067,16 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
       card.innerHTML = `<small>${item.label}</small><strong>${item.value}</strong><span>${item.description}</span>${item.action ? `<button type="button">${item.action}</button>` : ""}`;
       const button = card.querySelector<HTMLButtonElement>("button");
       if (button && item.onClick) button.onclick = item.onClick;
+      if (item.className === "flow-import" && item.onClick) {
+        const count = card.querySelector<HTMLElement>("strong");
+        if (count) {
+          count.setAttribute("role", "button");
+          count.tabIndex = 0;
+          count.title = "点击查看导入异常列表";
+          count.onclick = item.onClick;
+          count.onkeydown = (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); item.onClick?.(); } };
+        }
+      }
     });
   });
 
@@ -1705,32 +2084,29 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     document.querySelector<HTMLElement>(".inline-status-update")?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
-  function saveInlineStatusUpdate(updater: string, occurredAt: string, nextStatus: string, note: string) {
+  function saveInlineStatusUpdate(updater: string, occurredAt: string, nextStatus: string, note: string, reason = "") {
     if (!detail || !updater.trim() || !occurredAt || !nextStatus) return notify("请完整填写状态更新信息", "warning");
     if (new Date(occurredAt).getTime() > Date.now()) return notify("更新时间不能晚于当前时间", "warning");
+    setStatusConfirmation({ updater, occurredAt, nextStatus, note, reason });
+  }
+
+  function commitStatusUpdate(payload: { updater: string; occurredAt: string; nextStatus: string; note: string; reason: string }) {
+    if (!detail) return;
     const stageValues: Record<string, Pick<typeof tasks[number], "added" | "agreed" | "replied" | "intent">> = {
       "待添加": { added: "否", agreed: "否", replied: "否", intent: "否" }, "已添加待同意": { added: "是", agreed: "否", replied: "否", intent: "否" }, "已同意待回复": { added: "是", agreed: "是", replied: "否", intent: "否" }, "沟通中": { added: "是", agreed: "是", replied: "是", intent: "否" }, "已达成合作意向": { added: "是", agreed: "是", replied: "是", intent: "是" }, "未达成": { added: "是", agreed: "否", replied: "否", intent: "否" },
     };
-    setTasks((current) => current.map((task) => task.id === detail.id ? { ...task, ...stageValues[nextStatus], status: nextStatus, updated: occurredAt.replace("T", " ") } : task));
-    setStatusUpdates((current) => ({ ...current, [detail.id]: { status: nextStatus, updater, occurredAt: occurredAt.replace("T", " "), note } }));
-    notify(`已由 ${updater} 更新建联状态`, "success");
+    setTasks((current) => current.map((task) => task.id === detail.id ? { ...task, ...stageValues[payload.nextStatus], status: payload.nextStatus, updated: payload.occurredAt.replace("T", " ") } : task));
+    setStatusUpdates((current) => ({ ...current, [detail.id]: { status: payload.nextStatus, updater: payload.updater, occurredAt: payload.occurredAt.replace("T", " "), note: payload.note, reason: payload.reason } }));
+    publishSharedOutreachTasks(sharedOutreachTasks.map((task) => task.taskId === detail.id ? { ...task, processStage: ["已添加待同意", "已同意待回复", "沟通中"].includes(payload.nextStatus) ? ({ "已添加待同意": "已添加", "已同意待回复": "已同意", "沟通中": "已回复" } as Record<string, OutreachProcessStage>)[payload.nextStatus] : task.processStage, finalResult: payload.nextStatus === "已达成合作意向" ? "达成意向" : payload.nextStatus === "未达成" ? "未达成" : undefined, updatedAt: payload.occurredAt.replace("T", " ") } : task));
+    setStatusConfirmation(null);
+    setStatusUpdateOpen(false);
+    notify(`已由 ${payload.updater} 更新建联状态`, "success");
   }
 
   function saveStatusUpdate() {
     if (!detail || !statusUpdater.trim() || !statusOccurredAt || !statusNext) return notify("请完整填写状态更新信息", "warning");
     if (new Date(statusOccurredAt).getTime() > Date.now()) return notify("更新时间不能晚于当前时间", "warning");
-    const stageValues: Record<string, Pick<typeof tasks[number], "added" | "agreed" | "replied" | "intent">> = {
-      "待添加": { added: "否", agreed: "否", replied: "否", intent: "否" },
-      "已添加待同意": { added: "是", agreed: "否", replied: "否", intent: "否" },
-      "已同意待回复": { added: "是", agreed: "是", replied: "否", intent: "否" },
-      "沟通中": { added: "是", agreed: "是", replied: "是", intent: "否" },
-      "已达成合作意向": { added: "是", agreed: "是", replied: "是", intent: "是" },
-      "未达成": { added: "是", agreed: "否", replied: "否", intent: "否" },
-    };
-    setTasks((current) => current.map((task) => task.id === detail.id ? { ...task, ...stageValues[statusNext], status: statusNext, updated: statusOccurredAt.replace("T", " ") } : task));
-    setStatusUpdates((current) => ({ ...current, [detail.id]: { status: statusNext, updater: statusUpdater, occurredAt: statusOccurredAt.replace("T", " "), note: statusUpdateNote } }));
-    setStatusUpdateOpen(false);
-    notify(`已由 ${statusUpdater} 更新建联状态`, "success");
+    setStatusConfirmation({ updater: statusUpdater, occurredAt: statusOccurredAt, nextStatus: statusNext, note: statusUpdateNote, reason: "" });
   }
 
   useEffect(() => {
@@ -1758,12 +2134,15 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     const panel = document.createElement("section");
     panel.className = "detail-section inline-status-update";
     panel.innerHTML = `<h3>更新建联状态</h3><p>按实际发生时间补录或更正状态；更新记录会保留更新人、时间与备注。</p><form><label>更新后状态<select name="status"><option>待添加</option><option>已添加待同意</option><option>已同意待回复</option><option>沟通中</option><option>已达成合作意向</option><option>未达成</option></select></label><div><label>状态更新人<input name="updater" value="${detail.owner}" /></label><label>状态发生时间<input name="occurredAt" type="datetime-local" value="${statusTimeMax}" max="${statusTimeMax}" /></label></div><label>更新备注<textarea name="note" placeholder="选填，记录来源、沟通结论或更正原因"></textarea></label><button class="primary-button" type="submit">确认更新状态</button></form>`;
+    const reasonLabel = document.createElement("label");
+    reasonLabel.innerHTML = `<span>未达成原因</span><select name="reason"><option>未通过好友申请</option><option>长时间未回复</option><option>明确拒绝合作</option><option>合作条件不匹配</option><option>暂无合作意愿</option><option>其他</option></select>`;
+    panel.querySelector("textarea[name=note]")?.closest("label")?.insertAdjacentElement("beforebegin", reasonLabel);
     const statusSelect = panel.querySelector<HTMLSelectElement>("select[name=status]");
     if (statusSelect) statusSelect.value = detail.status;
     panel.querySelector<HTMLFormElement>("form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       const form = new FormData(event.currentTarget);
-      saveInlineStatusUpdate(String(form.get("updater") ?? ""), String(form.get("occurredAt") ?? ""), String(form.get("status") ?? ""), String(form.get("note") ?? ""));
+      saveInlineStatusUpdate(String(form.get("updater") ?? ""), String(form.get("occurredAt") ?? ""), String(form.get("status") ?? ""), String(form.get("note") ?? ""), String(form.get("reason") ?? ""));
     });
     sections[0].after(panel);
     return () => panel.remove();
@@ -1779,6 +2158,34 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     entry.className = "manual-status-update";
     entry.innerHTML = `<span>更新为${record.status}</span><small>${record.occurredAt} · ${record.updater}${record.note ? ` · ${record.note}` : ""}</small>`;
     timeline.append(entry);
+  }, [detail, statusUpdates]);
+
+  useEffect(() => {
+    if (!detail) return;
+    const drawer = document.querySelector<HTMLElement>(".contact-detail-drawer[aria-label='建联任务详情'] .drawer-body");
+    if (!drawer) return;
+    drawer.querySelector("[data-unreached-detail]")?.remove();
+    if (detail.status !== "未达成") return;
+    const update = statusUpdates[detail.id];
+    const section = document.createElement("section");
+    section.dataset.unreachedDetail = "true";
+    section.className = "detail-section unreached-detail-section";
+    section.innerHTML = `<h3>未达成信息</h3><div class="task-detail-grid"><div><small>未达成原因</small><strong>${update?.reason || "明确拒绝合作"}</strong></div><div><small>商务备注</small><strong>${update?.note || "暂无备注"}</strong></div></div>`;
+    drawer.querySelector(".contact-note")?.insertAdjacentElement("beforebegin", section);
+  }, [detail, statusUpdates]);
+
+  useEffect(() => {
+    if (!detail) return;
+    const timeline = document.querySelector<HTMLElement>(".contact-detail-drawer[aria-label='建联任务详情'] .contact-timeline");
+    if (!timeline) return;
+    const events: Array<{ name: string; operator: string; time: string; note: string }> = [{ name: "创建任务", operator: "陈旭光", time: "今天 08:42", note: "系统创建建联任务" }];
+    if (detail.added === "是") events.push({ name: "已添加待同意", operator: detail.owner, time: detail.updated, note: "已发送好友申请" });
+    if (detail.agreed === "是") events.push({ name: "已同意待回复", operator: detail.owner, time: detail.updated, note: "达人已通过好友申请" });
+    if (detail.replied === "是") events.push({ name: "沟通中", operator: detail.owner, time: detail.updated, note: "已收到达人回复" });
+    const manual = statusUpdates[detail.id];
+    if (manual) events.push({ name: `更新为${manual.status}`, operator: manual.updater, time: manual.occurredAt, note: manual.note || manual.reason || "手动更新建联状态" });
+    if (detail.status === "未达成" && !manual) events.push({ name: "未达成", operator: detail.owner, time: detail.updated, note: "明确拒绝合作" });
+    timeline.innerHTML = events.map((event) => `<div><span>${event.name}</span><small>操作人：${event.operator}<br/>时间：${event.time}<br/>备注：${event.note}</small></div>`).join("");
   }, [detail, statusUpdates]);
 
   function toggleAll() { setSelected((current) => allSelected ? current.filter((id) => !visibleTasks.some((task) => task.id === id)) : Array.from(new Set([...current, ...visibleTasks.map((task) => task.id)]))); }
@@ -1797,8 +2204,9 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     setTasks((current) => current.map((task, index) => index === 0 ? { ...task, added: "是", agreed: "是", replied: "是", intent: "否", status: "沟通中", updated: "刚刚" } : index === 3 ? { ...task, added: "是", agreed: "是", replied: "否", intent: "否", status: "已同意待回复", updated: "刚刚" } : task));
     setImportOpen(false);
     setImportReady(false);
-    setImportRecords((current) => [{ id: "IR20260819001", file: "商务回填表 · FP20260818007.xlsx", batch: "FP20260818007", operator: "陈旭光", importedAt: "刚刚", total: 120, updated: 2, status: "已完成" }, ...current]);
-    notify("已按商务回填表更新 2 条建联任务状态", "success");
+    setImportValidated(false);
+    setImportRecords((current) => [{ id: "IR20260819001", file: "商务回填表 · FP20260818007.xlsx", batch: "FP20260818007", operator: "陈旭光", importedAt: "刚刚", total: 120, updated: 115, success: 115, skipped: 5, unchanged: 20, status: "已完成" }, ...current]);
+    notify("导入完成：成功更新 115 条，异常跳过 5 条，无变化 20 条", "success");
   }
 
   return <>
@@ -1810,8 +2218,10 @@ function ContactManagement({ notify, onBack }: { notify: (message: string, tone?
     {batchOpen && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setBatchOpen(false); }}><section className="batch-modal" role="dialog" aria-modal="true" aria-labelledby="batch-title"><header><div><small>创建分配批次</small><h2 id="batch-title">从达人库选择并分配达人</h2><p>支持向无系统登录权限的商务人员分配任务。</p></div><button onClick={() => setBatchOpen(false)} aria-label="关闭">×</button></header><div className="batch-modal-body"><div className="batch-select-summary"><span>0</span><div><strong>暂未选择达人</strong><small>请先从达人库批量选择达人，再进入此流程。</small></div><button onClick={() => { setBatchOpen(false); notify("已进入达人库"); }}>去达人库选择</button></div><label>推广商品<select><option>请选择推广商品</option><option>创维循环扇</option><option>小熊破壁机</option></select></label><label>负责商务<select><option>请选择负责商务</option><option>陈小雨</option><option>林晓婷</option><option>张文豪</option></select></label><label>备注<textarea placeholder="可选，填写本次分配说明" /></label></div><footer><button className="ghost-button" onClick={() => setBatchOpen(false)}>取消</button><button className="primary-button" onClick={() => notify("请先从达人库选择达人", "warning")}>确认创建</button></footer></section></div>}
     {importOpen && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setImportOpen(false); }}><section className="import-modal" role="dialog" aria-modal="true" aria-labelledby="status-import-title"><header><div><small>批量更新建联状态</small><h2 id="status-import-title">导入商务回填表</h2><p>按任务编号匹配，统一更新是否添加、是否同意、是否回复和合作意向。</p></div><button onClick={() => setImportOpen(false)} aria-label="关闭">×</button></header><div className="import-modal-body"><div className="upload-zone"><span>⇧</span><strong>{importReady ? "商务回填表 · FP20260818007.xlsx" : "选择商务已回填的导出表"}</strong><small>{importReady ? "识别到 120 条记录，其中 2 条状态有变化" : "支持 .xlsx、.csv；必须保留建联任务编号和四个状态列"}</small><button onClick={() => setImportReady(true)}>{importReady ? "已选择" : "选择回填表"}</button></div><div className="import-fields"><h3>系统回写字段</h3><span>建联任务编号</span><span>是否添加</span><span>是否同意</span><span>是否回复</span><span>合作意向</span><span>商务备注</span></div></div><footer><button className="ghost-button" onClick={() => setImportOpen(false)}>取消</button><button className="primary-button" disabled={!importReady} onClick={applyImportedStatuses}>校验并更新状态</button></footer></section></div>}
     {batchDetail && <div className="drawer-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setBatchDetailId(null); }}><aside className="contact-detail-drawer" role="dialog" aria-modal="true" aria-label="分配批次详情"><header><div><small>分配批次详情</small><h2>{batchDetail.id}</h2><p>{batchDetail.product} · {batchDetail.owner}</p></div><button onClick={() => setBatchDetailId(null)} aria-label="关闭">×</button></header><div className="drawer-body"><div className="batch-detail-hero"><strong>共 {batchDetail.count} 位达人</strong><small>批量分配给 {batchDetail.owner} · {batchDetail.created}</small></div><section className="detail-section"><h3>批次信息</h3><div className="task-detail-grid"><div><small>推广商品</small><strong>{batchDetail.product}</strong></div><div><small>达人类型</small><strong>{batchDetail.type}</strong></div><div><small>负责商务</small><strong>{batchDetail.owner}</strong></div><div><small>创建时间</small><strong>{batchDetail.created}</strong></div></div></section><section className="detail-section"><h3>建联进度</h3><div className="batch-progress-list"><div><span>已添加</span><strong>{batchDetail.added} / {batchDetail.count}</strong></div><div><span>已同意</span><strong>{batchDetail.agreed} / {batchDetail.count}</strong></div><div><span>已回复</span><strong>{batchDetail.replied} / {batchDetail.count}</strong></div><div><span>达成意向</span><strong>{batchDetail.intent} / {batchDetail.count}</strong></div></div></section><section className="detail-section"><h3>业务操作</h3><p>主管导出本批次回填表后发送给商务；商务维护状态，收集后再导入回写达人与批次进度。</p><button className="primary-button" onClick={() => notify(`已导出 ${batchDetail.id} 的商务建联回填表`, "success")}>⇩ 导出本批次回填表</button></section></div><footer><button className="ghost-button" onClick={() => setBatchDetailId(null)}>关闭</button><button className="primary-button" onClick={() => { setBatchDetailId(null); setImportOpen(true); }}>导入商务回填表</button></footer></aside></div>}
+    {importExceptionsOpen && <div className="drawer-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setImportExceptionsOpen(false); }}><aside className="contact-detail-drawer" role="dialog" aria-modal="true" aria-label="导入异常列表"><header><div><small>商务回填导入</small><h2>导入异常列表</h2><p>集中查看待处理的异常文件与校验原因</p></div><button onClick={() => setImportExceptionsOpen(false)} aria-label="关闭">×</button></header><div className="drawer-body"><div className="import-exception-list">{importExceptions.map((exception) => <article key={exception.id}><div className="import-exception-head"><strong>{exception.file}</strong><span className="import-exception-status">{exception.status}</span></div><dl><div><dt>关联批次</dt><dd>{exception.batch}</dd></div><div><dt>异常数量</dt><dd className="warning">{exception.count}</dd></div><div><dt>异常原因</dt><dd>{exception.reason}</dd></div></dl><button className="row-action" type="button" onClick={() => { setImportExceptionsOpen(false); setImportHistoryOpen(true); notify(`已定位异常文件 ${exception.file}`); }}>查看关联导入记录</button></article>)}</div></div><footer><button className="ghost-button" onClick={() => setImportExceptionsOpen(false)}>关闭</button><button className="primary-button" onClick={() => { setImportExceptionsOpen(false); setImportOpen(true); }}>导入新回填表</button></footer></aside></div>}
     {importHistoryOpen && <div className="drawer-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setImportHistoryOpen(false); }}><aside className="contact-detail-drawer" role="dialog" aria-modal="true" aria-label="商务回填导入记录"><header><div><small>商务回填导入</small><h2>导入记录</h2><p>保留每次回填表的校验与回写结果</p></div><button onClick={() => setImportHistoryOpen(false)} aria-label="关闭">×</button></header><div className="drawer-body"><div className="import-record-list">{importRecords.map((record) => <button key={record.id} onClick={() => setImportRecordId(record.id)}><div><strong>{record.file}</strong><small>{record.id} · {record.importedAt} · {record.operator}</small></div><span>{record.status}</span><i>›</i></button>)}</div></div><footer><button className="ghost-button" onClick={() => setImportHistoryOpen(false)}>关闭</button><button className="primary-button" onClick={() => { setImportHistoryOpen(false); setImportOpen(true); }}>导入新回填表</button></footer></aside></div>}
     {importRecord && <div className="drawer-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setImportRecordId(null); }}><aside className="contact-detail-drawer" role="dialog" aria-modal="true" aria-label="导入记录详情"><header><div><small>导入记录详情</small><h2>{importRecord.id}</h2><p>{importRecord.file}</p></div><button onClick={() => setImportRecordId(null)} aria-label="关闭">×</button></header><div className="drawer-body"><div className="batch-detail-hero"><strong>{importRecord.status}</strong><small>{importRecord.importedAt} · {importRecord.operator}</small></div><section className="detail-section"><h3>导入信息</h3><div className="task-detail-grid"><div><small>关联批次</small><strong>{importRecord.batch}</strong></div><div><small>导入记录数</small><strong>{importRecord.total}</strong></div><div><small>更新任务数</small><strong>{importRecord.updated}</strong></div><div><small>处理状态</small><strong>{importRecord.status}</strong></div></div></section><section className="detail-section"><h3>回写结果</h3><p>系统已按建联任务编号匹配回填表，并同步更新达人建联状态及所属批次的进度统计。</p></section></div><footer><button className="primary-button" onClick={() => setImportRecordId(null)}>完成</button></footer></aside></div>}
+    {statusConfirmation && detail && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setStatusConfirmation(null); }}><section className="status-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="status-confirm-title"><header><div><small>确认状态修改</small><h2 id="status-confirm-title">确认修改建联状态？</h2><p>{detail.creator} · {detail.id}</p></div><button onClick={() => setStatusConfirmation(null)} aria-label="关闭">×</button></header><div className="status-confirm-body"><div><small>当前状态</small><strong>{detail.status}</strong></div><span>↓</span><div><small>修改后</small><strong>{statusConfirmation.nextStatus}</strong></div><p>确认后将按填写的发生时间写入状态记录，允许状态倒退。</p></div><footer><button className="ghost-button" onClick={() => setStatusConfirmation(null)}>取消</button><button className="primary-button" onClick={() => commitStatusUpdate(statusConfirmation)}>确认修改</button></footer></section></div>}
     {statusUpdateOpen && detail && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setStatusUpdateOpen(false); }}><section className="status-update-modal" role="dialog" aria-modal="true" aria-labelledby="status-update-title"><header><div><small>建联任务状态回填</small><h2 id="status-update-title">更新建联状态</h2><p>{detail.creator} · {detail.id}</p></div><button onClick={() => setStatusUpdateOpen(false)} aria-label="关闭">×</button></header><div className="status-update-body"><div className="status-update-tip"><span>i</span><p>状态可按实际发生时间补录或更正；提交后会保留更新人、时间与备注记录。</p></div><label>更新后状态<select value={statusNext} onChange={(event) => setStatusNext(event.target.value)}><option>待添加</option><option>已添加待同意</option><option>已同意待回复</option><option>沟通中</option><option>已达成合作意向</option><option>未达成</option></select></label><div className="status-update-grid"><label>状态更新人<input value={statusUpdater} onChange={(event) => setStatusUpdater(event.target.value)} placeholder="默认负责商务" /></label><label>状态发生时间<input type="datetime-local" value={statusOccurredAt} max={statusTimeMax} onChange={(event) => setStatusOccurredAt(event.target.value)} /></label></div><label>更新备注<textarea value={statusUpdateNote} onChange={(event) => setStatusUpdateNote(event.target.value)} placeholder="选填，记录来源、沟通结论或更正原因" /></label></div><footer><button className="ghost-button" onClick={() => setStatusUpdateOpen(false)}>取消</button><button className="primary-button" onClick={saveStatusUpdate}>确认更新</button></footer></section></div>}
   </>;
 }
@@ -1853,9 +2263,13 @@ function HistoricalAnalysis({ notify, onBack }: { notify: (message: string, tone
 function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: NonNullable<Toast>["tone"]) => void; onBack: () => void }) {
   const [tab, setTab] = useState<"tasks" | "records">("tasks");
   const [createOpen, setCreateOpen] = useState(false);
+  const [retryConfirmTaskId, setRetryConfirmTaskId] = useState<string | null>(null);
+  const [stopConfirmTaskId, setStopConfirmTaskId] = useState<string | null>(null);
+  const currentOperator = "陈旭光";
   const [statusFilter, setStatusFilter] = useState("全部");
   const [taskPage, setTaskPage] = useState(1);
   const [detailId, setDetailId] = useState<string | null>(null);
+  const [technicalLogOpen, setTechnicalLogOpen] = useState(false);
   const [tasks, setTasks] = useState([
     { id: "DL202608180038", yidaoId: "TASK-20260818-01128", scheduleUuid: "SCH-DIRECT-LINK-01", creator: "小家电研究所", douyinId: "xiaojd_lab", uid: "dy_86541972", product: "创维循环扇", store: "创维生活电器旗舰店", productId: "100987654321", commission: "25%", remark: "首播专属佣金", created: "今天 10:18", status: "执行中", api: "task/start 已受理" },
     { id: "DL202608180037", yidaoId: "TASK-20260818-01127", scheduleUuid: "SCH-DIRECT-LINK-01", creator: "洁净生活家", douyinId: "clean_life", uid: "dy_10376294", product: "创维循环扇", store: "创维生活电器旗舰店", productId: "100987654321", commission: "22%", remark: "", created: "今天 10:06", status: "创建成功", api: "task/query 正常" },
@@ -1870,14 +2284,50 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
   const [taskName, setTaskName] = useState(`${today} 第一批`);
   const [bulkText, setBulkText] = useState("");
   const [parsedCreators, setParsedCreators] = useState<Array<{ creator: string; douyinId: string; uid: string }>>([]);
+  const [submitConfirmation, setSubmitConfirmation] = useState<{ creators: Array<{ creator: string; douyinId: string; uid: string }>; product: string; store: string; count: number } | null>(null);
   const [form, setForm] = useState({ scheduleUuid: "SCH-DIRECT-LINK-01", creator: "", douyinId: "", uid: "", product: "", store: "", productId: "", remark: "", commission: "" });
-  const filteredTasks = tasks.filter((task) => statusFilter === "全部" || task.status === statusFilter);
+  const ownedTasks = tasks.filter((task) => getTaskOwner(task) === currentOperator);
+  const filteredTasks = ownedTasks.filter((task) => statusFilter === "全部" || task.status === statusFilter);
   const taskPageSize = 5;
   const taskPageCount = Math.max(1, Math.ceil(filteredTasks.length / taskPageSize));
   const visibleTasks = filteredTasks.slice((Math.min(taskPage, taskPageCount) - 1) * taskPageSize, Math.min(taskPage, taskPageCount) * taskPageSize);
-  const detail = tasks.find((task) => task.id === detailId) ?? null;
+  const detail = ownedTasks.find((task) => task.id === detailId) ?? null;
+  const retryTask = ownedTasks.find((task) => task.id === retryConfirmTaskId) ?? null;
+  const stopConfirmTask = ownedTasks.find((task) => task.id === stopConfirmTaskId) ?? null;
+
+  useEffect(() => { setTechnicalLogOpen(false); }, [detailId]);
 
   useEffect(() => { setTaskPage(1); }, [statusFilter]);
+
+  useEffect(() => {
+    const description = document.querySelector<HTMLElement>(".link-head p");
+    if (description) description.textContent = `当前身份：普通商务 · ${currentOperator}，仅展示本人创建的任务、执行结果与API调用记录。`;
+    const taskTabCount = document.querySelector<HTMLElement>(".link-tabs .tabs button:first-child span");
+    if (taskTabCount) taskTabCount.textContent = String(ownedTasks.length);
+    const recordTabCount = document.querySelector<HTMLElement>(".link-tabs .tabs button:nth-child(2) span");
+    if (recordTabCount) recordTabCount.textContent = String(ownedTasks.length + 3);
+    const apiNote = document.querySelector<HTMLElement>(".api-record-note p");
+    if (apiNote) apiNote.textContent = "自动化任务 → 执行记录 → API调用日志。此处仅展示当前商务有权限查看的调用记录。";
+    const kpiValues = document.querySelectorAll<HTMLElement>(".link-kpis article strong");
+    if (kpiValues[0]) kpiValues[0].textContent = String(ownedTasks.length + 8);
+    if (kpiValues[1]) kpiValues[1].textContent = String(ownedTasks.filter((task) => task.status === "执行中").length);
+    if (kpiValues[3]) kpiValues[3].textContent = String(ownedTasks.filter((task) => task.status === "异常").length);
+    const kpiCards = document.querySelectorAll<HTMLElement>(".link-kpis article");
+    const finished = ownedTasks.filter((task) => ["创建成功", "异常"].includes(task.status));
+    const successCount = ownedTasks.filter((task) => task.status === "创建成功").length;
+    const successRate = finished.length ? `${Math.round((successCount / finished.length) * 1000) / 10}%` : "—";
+    const labels = ["今日执行次数", "成功创建链接数量", "失败任务数量", "成功率"];
+    const values = [String(ownedTasks.length + 8), String(successCount), String(ownedTasks.filter((task) => task.status === "异常").length), successRate];
+    const details = ["包含已完成、执行中及排队中的任务", "已完成定向链接创建的任务", "需要检查并重新执行的任务", "成功创建链接 ÷ 已结束任务"];
+    kpiCards.forEach((card, index) => {
+      const label = card.querySelector<HTMLElement>("small");
+      const value = card.querySelector<HTMLElement>("strong");
+      const detail = card.querySelector<HTMLElement>("em");
+      if (label) label.textContent = labels[index];
+      if (value) value.textContent = values[index];
+      if (detail) detail.textContent = details[index];
+    });
+  }, [tasks, ownedTasks.length]);
 
   useEffect(() => {
     if (tab !== "tasks") return;
@@ -1906,9 +2356,9 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
       actionCell?.querySelector("[data-link-task-action]")?.remove();
       if (!task) return;
       const action = task.status === "待回查" ? { label: "立即回查", run: () => checkLinkTask(task.id) }
-        : task.status === "排队中" ? { label: "取消排队", run: () => stopTask(task.id) }
-        : task.status === "执行中" ? { label: "停止", run: () => stopTask(task.id) }
-        : task.status === "异常" ? { label: "重试", run: () => retryLinkTask(task.id) }
+        : task.status === "排队中" ? { label: "停止", run: () => setStopConfirmTaskId(task.id) }
+        : task.status === "执行中" ? { label: "停止", run: () => setStopConfirmTaskId(task.id) }
+        : task.status === "异常" ? { label: "重新执行", run: () => setRetryConfirmTaskId(task.id) }
         : task.status === "已停止" ? { label: "重新执行", run: () => retryLinkTask(task.id) }
         : task.status === "创建成功" ? { label: "复制链接", run: () => copyDirectedLink(task.id) }
         : null;
@@ -1985,9 +2435,9 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
         queueCell.innerHTML = `<div class="yidao-queue-cell ${queue.tone}"><strong>${queue.label}</strong><small>${queue.detail}</small></div>`;
         row.insertBefore(queueCell, actionCell);
         const action = task.status === "待回查" ? { label: "立即回查", run: () => checkLinkTask(task.id) }
-          : task.status === "排队中" ? { label: "取消排队", run: () => stopTask(task.id) }
-          : task.status === "执行中" ? { label: "停止", run: () => stopTask(task.id) }
-          : task.status === "异常" ? { label: "重试", run: () => retryLinkTask(task.id) }
+          : task.status === "排队中" ? { label: "停止", run: () => setStopConfirmTaskId(task.id) }
+          : task.status === "执行中" ? { label: "停止", run: () => setStopConfirmTaskId(task.id) }
+          : task.status === "异常" ? { label: "重新执行", run: () => setRetryConfirmTaskId(task.id) }
           : task.status === "已停止" ? { label: "重新执行", run: () => retryLinkTask(task.id) }
           : task.status === "创建成功" ? { label: "复制链接", run: () => copyDirectedLink(task.id) }
           : null;
@@ -2003,6 +2453,18 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
     }, 0);
     return () => window.clearTimeout(timer);
   }, [tab, tasks, statusFilter, taskPage]);
+
+  useEffect(() => {
+    if (tab !== "records") return;
+    const timer = window.setTimeout(() => {
+      document.querySelectorAll<HTMLTableRowElement>(".api-record-table tbody tr").forEach((row) => {
+        const taskId = row.querySelector("td:nth-child(4) button")?.textContent ?? "";
+        const task = tasks.find((item) => item.id === taskId);
+        if (task && getTaskOwner(task) !== currentOperator) row.remove();
+      });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [tab, tasks]);
 
   useEffect(() => {
     const openTaskDetail = (event: Event) => setDetailId((event as CustomEvent<string>).detail);
@@ -2054,7 +2516,7 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
     const pasteTab = entry.querySelector<HTMLButtonElement>(".entry-tabs button:first-child");
     if (pasteTab) pasteTab.textContent = "批量粘贴";
     const textarea = entry.querySelector<HTMLTextAreaElement>("textarea");
-    if (textarea) textarea.placeholder = "请填写达人UID，支持批量粘贴，请用英文逗号（,）隔开，每次最多支持200个";
+    if (textarea) textarea.placeholder = "请填写达人UID，支持批量粘贴，请用英文逗号（,）隔开，每次最多支持100个";
     entry.querySelector<HTMLButtonElement>(".entry-actions button:last-child")?.remove();
   }, [createOpen, entryMode]);
 
@@ -2065,9 +2527,10 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
     if (!drawerBody || !taskSection) return;
     drawerBody.querySelector("[data-link-uid-list]")?.remove();
     Array.from(taskSection.querySelectorAll<HTMLElement>(".task-detail-grid > div")).filter((item) => ["达人昵称", "达人抖音ID", "达人UID"].includes(item.querySelector("small")?.textContent ?? "")).forEach((item) => item.remove());
-    const uidCount = detail.id.endsWith("038") ? 126 : detail.id.endsWith("037") ? 84 : detail.id.endsWith("036") ? 63 : 42;
+    const batchDetail = detail as typeof detail & { uidCount?: number; uidList?: string[] };
+    const uidCount = batchDetail.uidCount ?? (detail.id.endsWith("038") ? 126 : detail.id.endsWith("037") ? 84 : detail.id.endsWith("036") ? 63 : 42);
     const suffix = detail.uid.replace(/^dy_/, "");
-    const uids = Array.from({ length: uidCount }, (_, index) => index === 0 ? detail.uid : `dy_${suffix.slice(0, 5)}${String(index + 1).padStart(5, "0")}`);
+    const uids = batchDetail.uidList?.length ? batchDetail.uidList : Array.from({ length: uidCount }, (_, index) => index === 0 ? detail.uid : `dy_${suffix.slice(0, 5)}${String(index + 1).padStart(5, "0")}`);
     const uidSection = document.createElement("section");
     uidSection.className = "link-uid-list";
     uidSection.dataset.linkUidList = "true";
@@ -2083,7 +2546,7 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
 
   useEffect(() => {
     if (!detail) return;
-    const section = Array.from(document.querySelectorAll<HTMLElement>(".link-detail-drawer .detail-section")).find((item) => item.querySelector("h3")?.textContent === "影刀执行记录");
+    const section = Array.from(document.querySelectorAll<HTMLElement>(".link-detail-drawer .detail-section")).find((item) => ["影刀执行记录", "技术信息"].includes(item.querySelector("h3")?.textContent ?? ""));
     if (!section) return;
     const hero = document.querySelector<HTMLElement>(".link-detail-drawer .link-result-hero");
     hero?.classList.toggle("queued", detail.status === "排队中" || detail.status === "待回查");
@@ -2097,6 +2560,53 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
     section.querySelector("h3")?.after(item);
   }, [detail]);
 
+  useEffect(() => {
+    if (!detail) return;
+    const business = getBusinessExecution(detail);
+    const hero = document.querySelector<HTMLElement>(".link-detail-drawer .link-result-hero");
+    if (hero) {
+      hero.className = `link-result-hero ${business.tone}`;
+      hero.innerHTML = `<span>${detail.status === "执行中" ? "◌" : detail.status === "异常" ? "!" : detail.status === "已停止" ? "Ⅱ" : "✓"}</span><div><strong>${business.title}</strong><small>${business.detail}</small></div>`;
+    }
+    const section = Array.from(document.querySelectorAll<HTMLElement>(".link-detail-drawer .detail-section")).find((item) => ["影刀执行记录", "技术信息"].includes(item.querySelector("h3")?.textContent ?? ""));
+    if (!section) return;
+    section.classList.add("technical-log-section");
+    section.innerHTML = `<div class="technical-log-heading"><h3>技术信息</h3><button type="button" class="row-action" data-technical-log-toggle>${technicalLogOpen ? "收起技术日志" : "查看技术日志"}</button></div>${technicalLogOpen ? `<div class="yidao-log"><div><span>请求时间</span><p><strong>10:18:02</strong> API调用状态：${detail.api}</p></div><div><span>影刀受理</span><p><strong>10:18:04</strong> 返回影刀任务ID：${detail.yidaoId}</p></div><div><span>返回结果</span><p><strong>10:18:10</strong> 当前任务状态：${detail.status}</p></div></div>` : ""}`;
+    section.querySelector<HTMLButtonElement>("[data-technical-log-toggle]")?.addEventListener("click", () => setTechnicalLogOpen((value) => !value));
+  }, [detail, technicalLogOpen]);
+
+  useEffect(() => {
+    if (!detail) return;
+    const drawer = document.querySelector<HTMLElement>(".link-detail-drawer .drawer-body");
+    const firstSection = drawer?.querySelector<HTMLElement>(".detail-section");
+    if (!drawer || !firstSection) return;
+    drawer.querySelector("[data-business-context]")?.remove();
+    const task = detail as typeof detail & { uidCount?: number };
+    const uidCount = task.uidCount ?? (detail.id.endsWith("038") ? 126 : detail.id.endsWith("037") ? 84 : detail.id.endsWith("036") ? 63 : 42);
+    const business = getBusinessExecution(detail);
+    const taskName = detail.remark.includes(" · ") ? detail.remark.split(" · ")[0] : `定向链接任务 · ${detail.id}`;
+    const section = document.createElement("section");
+    section.className = "detail-section link-business-context";
+    section.dataset.businessContext = "true";
+    section.innerHTML = `<h3>基础信息</h3><div class="task-detail-grid"><div><small>任务编号</small><strong>${detail.id}</strong></div><div><small>任务名称</small><strong>${taskName}</strong></div><div><small>创建人</small><strong>陈旭光</strong></div><div><small>创建时间</small><strong>${detail.created}</strong></div><div><small>当前状态</small><strong>${business.title}</strong></div></div><h3>商品信息</h3><div class="task-detail-grid"><div><small>商品名称</small><strong>${detail.product}</strong></div><div><small>商品ID</small><strong>${detail.productId}</strong></div><div><small>所属店铺</small><strong>${detail.store}</strong></div><div><small>佣金比例</small><strong>${detail.commission}</strong></div></div><h3>执行信息</h3><div class="task-detail-grid"><div><small>达人数量</small><strong>${uidCount} 个</strong></div><div><small>执行时间</small><strong>${detail.created}</strong></div><div><small>执行结果</small><strong>${business.detail}</strong></div></div>`;
+    firstSection.before(section);
+  }, [detail]);
+
+  useEffect(() => {
+    if (!detail) return;
+    const drawer = document.querySelector<HTMLElement>(".link-detail-drawer .drawer-body");
+    if (!drawer) return;
+    drawer.querySelector("[data-execution-history]")?.remove();
+    const technicalSection = Array.from(drawer.querySelectorAll<HTMLElement>(".detail-section")).find((section) => section.classList.contains("technical-log-section"));
+    if (!technicalSection) return;
+    const business = getBusinessExecution(detail);
+    const section = document.createElement("section");
+    section.className = "detail-section execution-history-section";
+    section.dataset.executionHistory = "true";
+    section.innerHTML = `<h3>执行记录</h3><p class="execution-history-note">自动化任务 ${detail.id} 的执行历史，API调用日志按本次执行记录关联保存。</p><div class="execution-history-card"><div><small>执行时间</small><strong>${detail.created}</strong></div><div><small>执行结果</small><strong>${business.title}</strong></div><div><small>触发方式</small><strong>商务手动创建</strong></div></div>`;
+    technicalSection.before(section);
+  }, [detail]);
+
   function getYidaoQueue(task: typeof tasks[number] | undefined) {
     if (!task) return { label: "—", detail: "—", tone: "done" };
     const sequence = Number(task.id.slice(-2));
@@ -2108,13 +2618,34 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
     return { label: "已移出队列", detail: "本次任务未继续执行", tone: "stopped" };
   }
 
+  function getTaskOwner(task: typeof tasks[number]) {
+    const owner = (task as typeof task & { owner?: string }).owner;
+    if (owner) return owner;
+    if (task.created === "刚刚") return currentOperator;
+    return Number(task.id.slice(-2)) % 3 === 0 ? "林晓婷" : "陈旭光";
+  }
+
+  function getBusinessExecution(task: typeof tasks[number]) {
+    if (task.status === "创建成功") return { title: "执行成功", detail: "已完成定向链接创建", tone: "success" };
+    if (task.status === "异常") return { title: "执行失败", detail: "原因：影刀执行异常", tone: "failed" };
+    if (task.status === "执行中") return { title: "正在创建定向链接", detail: "影刀任务正在执行中", tone: "running" };
+    if (task.status === "已停止") return { title: "执行已停止", detail: "任务已由人工停止，已处理数据继续保留", tone: "stopped" };
+    return { title: "等待执行", detail: "任务已提交，等待影刀受理", tone: "queued" };
+  }
+
   function submitTask() {
     const creatorsToCreate = parsedCreators.length ? parsedCreators : form.uid.trim() ? [{ creator: form.creator || "未命名达人", douyinId: form.douyinId, uid: form.uid }] : [];
     if (!taskName.trim() || !form.productId.trim() || !form.product.trim() || !form.commission.trim() || !creatorsToCreate.length) { notify("请输入可匹配的定向商品ID，并至少提供一个达人UID", "warning"); return; }
-    const newTasks = creatorsToCreate.map((creator, index) => ({ id: `DL20260818${String(tasks.length + 39 + index).padStart(3, "0")}`, yidaoId: "待 task/newest/list 回查", scheduleUuid: form.scheduleUuid, creator: creator.creator, douyinId: creator.douyinId, uid: creator.uid, product: form.product || `商品ID：${form.productId}`, store: form.store || "—", productId: form.productId || "—", commission: `${form.commission.replace("%", "")}%`, remark: `${taskName}${form.remark ? ` · ${form.remark}` : ""}`, created: "刚刚", status: "待回查", api: "task/start 已受理" }));
-    setTasks((current) => [...newTasks, ...current]); setCreateOpen(false); setTab("tasks"); setBulkText(""); setParsedCreators([]); setTaskName(`${today} 第${Math.floor(tasks.length / 20) + 2}批`); setForm({ scheduleUuid: "SCH-DIRECT-LINK-01", creator: "", douyinId: "", uid: "", product: "", store: "", productId: "", remark: "", commission: "" }); notify(`已触发 ${newTasks.length} 位达人的常规任务，正在回查影刀 Task UUID`, "success");
+    if (creatorsToCreate.length > 100) { notify("单次最多支持100个达人，请拆分后重新创建任务。", "warning"); return; }
+    setSubmitConfirmation({ creators: creatorsToCreate, product: form.product || `商品ID：${form.productId}`, store: form.store || "—", count: creatorsToCreate.length });
   }
-  function parseBulkText() { const values = bulkText.split(/\n|；|;|，|,/).map((value) => value.trim()).filter(Boolean); if (values.length > 200) { notify("一次最多支持粘贴 200 个达人UID", "warning"); return; } const rows = values.map((uid) => ({ creator: "未命名达人", douyinId: "", uid })); setParsedCreators(rows); notify(`已解析 ${rows.length} 位达人UID，请确认后创建`, "success"); }
+  function confirmSubmitTask() {
+    if (!submitConfirmation) return;
+    const { creators: creatorsToCreate } = submitConfirmation;
+    const newTask = { id: `DL20260818${String(tasks.length + 39).padStart(3, "0")}`, yidaoId: "待 task/newest/list 回查", scheduleUuid: form.scheduleUuid, creator: creatorsToCreate.length === 1 ? creatorsToCreate[0].creator : `${creatorsToCreate.length} 位达人`, douyinId: creatorsToCreate[0]?.douyinId ?? "", uid: creatorsToCreate.map((creator) => creator.uid).join(","), uidCount: creatorsToCreate.length, uidList: creatorsToCreate.map((creator) => creator.uid), product: form.product || `商品ID：${form.productId}`, store: form.store || "—", productId: form.productId || "—", commission: `${form.commission.replace("%", "")}%`, remark: `${taskName}${form.remark ? ` · ${form.remark}` : ""}`, created: "刚刚", status: "待回查", api: "task/start 已受理" };
+    setTasks((current) => [newTask, ...current]); setSubmitConfirmation(null); setCreateOpen(false); setTab("tasks"); setBulkText(""); setParsedCreators([]); setTaskName(`${today} 第${Math.floor(tasks.length / 20) + 2}批`); setForm({ scheduleUuid: "SCH-DIRECT-LINK-01", creator: "", douyinId: "", uid: "", product: "", store: "", productId: "", remark: "", commission: "" }); notify(`已触发 1 次批量添加任务（${creatorsToCreate.length} 位达人），正在回查影刀 Task UUID`, "success");
+  }
+  function parseBulkText() { const values = bulkText.split(/\n|；|;|，|,/).map((value) => value.trim()).filter(Boolean); if (values.length > 100) { setParsedCreators([]); notify("单次最多支持100个达人，请拆分后重新创建任务。", "warning"); return; } const rows = values.map((uid) => ({ creator: "未命名达人", douyinId: "", uid })); setParsedCreators(rows); notify(`已识别达人：${rows.length} 个，请确认后创建`, "success"); }
   function stopTask(id: string) { setTasks((current) => current.map((task) => task.id === id ? { ...task, status: "已停止", api: "task/stop 成功" } : task)); setDetailId(null); notify("已停止该常规任务下所有未结束的影刀Job", "success"); }
   function checkLinkTask(id: string) { setTasks((current) => current.map((task) => task.id === id ? { ...task, yidaoId: "TASK-20260818-01129", status: "排队中", api: "task/query 已入队" } : task)); notify("已完成影刀任务回查，任务已进入执行队列", "success"); }
   function retryLinkTask(id: string) { setTasks((current) => current.map((task) => task.id === id ? { ...task, status: "排队中", api: "task/start 已重新入队", created: "刚刚" } : task)); notify("已重新触发影刀常规任务，等待队列执行", "success"); }
@@ -2124,7 +2655,8 @@ function LinkAutomation({ notify, onBack }: { notify: (message: string, tone?: N
     <header className="page-header link-head"><div><h1>定向链接自动化</h1><p>触发影刀已预配置的常规任务，并在内容罗盘内回查、监控和停止任务。</p></div><div className="header-actions"><button className="primary-button" onClick={() => setCreateOpen(true)}>＋ 创建链接任务</button></div></header>
     <section className="link-kpis"><article><span className="link-kpi-icon violet">今</span><div><small>今日已发送任务</small><strong>{tasks.length + 28}</strong><em>影刀API调用成功率 96.8%</em></div></article><article><span className="link-kpi-icon cyan">行</span><div><small>执行中的影刀任务</small><strong>{tasks.filter((task) => task.status === "执行中").length}</strong><em>可随时查询或停止</em></div></article><article><span className="link-kpi-icon green">成</span><div><small>创建成功</small><strong>36</strong><em>已通过业务结果校验</em></div></article><article><span className="link-kpi-icon red">异</span><div><small>异常任务</small><strong>{tasks.filter((task) => task.status === "异常").length}</strong><em>需要检查影刀执行结果</em></div></article></section>
     <section className="panel link-panel"><div className="link-tabs"><div className="tabs"><button aria-pressed={tab === "tasks"} className={tab === "tasks" ? "active" : ""} onClick={() => setTab("tasks")}>常规任务监控 <span>{tasks.length}</span></button><button aria-pressed={tab === "records"} className={tab === "records" ? "active" : ""} onClick={() => setTab("records")}>API调用记录 <span>{tasks.length + 8}</span></button></div><button className="text-button" onClick={onBack}>← 返回工作台</button></div>{tab === "tasks" ? <><div className="link-filter"><div>{["全部", "待回查", "执行中", "创建成功", "异常", "已停止"].map((status) => <button key={status} aria-pressed={statusFilter === status} className={statusFilter === status ? "active" : ""} onClick={() => setStatusFilter(status)}>{status}</button>)}</div><button onClick={() => notify("已请求 task/query 刷新任务状态", "success")}>↻ 同步影刀状态</button></div><div className="table-wrap link-table"><table><thead><tr><th>内容罗盘任务</th><th>影刀 Task UUID</th><th>达人</th><th>商品 / 店铺</th><th>定向商品ID</th><th>佣金系数</th><th>API状态</th><th>任务状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>{visibleTasks.map((task) => <tr key={task.id}><td><button className="table-link" onClick={() => setDetailId(task.id)}>{task.id}</button></td><td><code>{task.yidaoId}</code></td><td><div className="link-creator"><strong>{task.creator}</strong><small>{task.douyinId} · {task.uid}</small></div></td><td><div className="link-product"><strong>{task.product}</strong><small>{task.store}</small></div></td><td><code>{task.productId}</code></td><td><strong>{task.commission}</strong></td><td><span className={`api-status ${task.api.includes("异常") ? "failed" : task.api === "已发送" ? "sending" : "success"}`}>{task.api}</span></td><td><span className={`link-status ${task.status === "异常" ? "failed" : task.status === "执行中" ? "running" : task.status === "已停止" ? "stopped" : "success"}`}>{task.status}</span></td><td>{task.created}</td><td><button className="row-action" onClick={() => setDetailId(task.id)}>查看</button></td></tr>)}</tbody></table></div></> : <ApiRecords tasks={tasks} notify={notify} />}</section>
-    {createOpen && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateOpen(false); }}><section className="link-create-modal link-create-batch" role="dialog" aria-modal="true" aria-labelledby="link-create-title"><header><div><small>批量创建定向链接</small><h2 id="link-create-title">定向链接自动化任务</h2><p>先关联影刀常规任务，再录入本次公共商品信息和一个或多个达人。</p></div><button onClick={() => setCreateOpen(false)} aria-label="关闭">×</button></header><div className="link-form"><label>影刀常规任务<span>*</span><select value={form.scheduleUuid} onChange={(event) => setForm({ ...form, scheduleUuid: event.target.value })}><option value="SCH-DIRECT-LINK-01">定向链接创建 · 家电类</option><option value="SCH-DIRECT-LINK-02">定向链接创建 · 厨电类</option><option value="SCH-DIRECT-LINK-03">定向链接创建 · 直播专场</option></select></label><label>定向链接自动化任务名称<span>*</span><input value={taskName} onChange={(event) => setTaskName(event.target.value)} /></label><label>商品（与商品ID二选一）<input value={form.product} onChange={(event) => setForm({ ...form, product: event.target.value })} placeholder="输入商品名称" /></label><label>定向商品ID（与商品二选一）<input value={form.productId} onChange={(event) => setForm({ ...form, productId: event.target.value })} placeholder="输入精选联盟商品ID" /></label><label>商品店铺<input value={form.store} onChange={(event) => setForm({ ...form, store: event.target.value })} placeholder="输入商品所属店铺" /></label><label>指定佣金系数（正常价格）<span>*</span><div className="commission-input"><input value={form.commission} onChange={(event) => setForm({ ...form, commission: event.target.value })} placeholder="例如：25" /><em>%</em></div></label><div className="creator-entry full"><div className="entry-tabs"><button className={entryMode === "ai" ? "active" : ""} onClick={() => setEntryMode("ai")}>AI整段解析</button><button className={entryMode === "paste" ? "active" : ""} onClick={() => setEntryMode("paste")}>批量粘贴 / 表格导入</button><button className={entryMode === "single" ? "active" : ""} onClick={() => setEntryMode("single")}>单个录入</button></div>{entryMode !== "single" ? <><textarea value={bulkText} onChange={(event) => setBulkText(event.target.value)} placeholder={entryMode === "ai" ? "例如：找小家电研究所、洁净生活家做创维循环扇定向链接，佣金25%。也可以无序输入一整段需求。" : "每行一位达人：达人昵称，抖音ID，达人UID。可直接粘贴表格内容。"} /><div className="entry-actions"><button onClick={parseBulkText}>{entryMode === "ai" ? "AI解析信息" : "解析粘贴内容"}</button><button onClick={() => { setBulkText("小家电研究所，xiaojd_lab，dy_86541972\n洁净生活家，clean_life，dy_10376294"); setEntryMode("paste"); }}>⇧ 导入表格（演示）</button></div></> : <div className="single-creator"><label>达人UID<span>*</span><input value={form.uid} onChange={(event) => setForm({ ...form, uid: event.target.value })} placeholder="必填" /></label><label>达人昵称<input value={form.creator} onChange={(event) => setForm({ ...form, creator: event.target.value })} placeholder="选填" /></label><label>达人抖音ID<input value={form.douyinId} onChange={(event) => setForm({ ...form, douyinId: event.target.value })} placeholder="选填" /></label></div>}{parsedCreators.length > 0 && <div className="parsed-summary">已解析 <strong>{parsedCreators.length}</strong> 位达人，将按 UID 创建任务</div>}</div><label className="full">特殊备注<textarea value={form.remark} onChange={(event) => setForm({ ...form, remark: event.target.value })} placeholder="可选，传递给影刀执行人员的特殊说明" /></label><div className="api-contract-note"><span>API</span><p>系统将为每位达人触发关联的影刀常规任务，并通过 task/newest/list 回查 Task UUID。</p></div></div><footer><button className="ghost-button" onClick={() => setCreateOpen(false)}>取消</button><button className="primary-button" onClick={submitTask}>创建并调用影刀</button></footer></section></div>}
+    {createOpen && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateOpen(false); }}><section className="link-create-modal link-create-batch" role="dialog" aria-modal="true" aria-labelledby="link-create-title"><header><div><small>批量创建定向链接</small><h2 id="link-create-title">定向链接自动化任务</h2><p>先关联影刀常规任务，再录入本次公共商品信息和一个或多个达人。</p></div><button onClick={() => setCreateOpen(false)} aria-label="关闭">×</button></header><div className="link-form"><label>影刀常规任务<span>*</span><select value={form.scheduleUuid} onChange={(event) => setForm({ ...form, scheduleUuid: event.target.value })}><option value="SCH-DIRECT-LINK-01">定向链接创建 · 家电类</option><option value="SCH-DIRECT-LINK-02">定向链接创建 · 厨电类</option><option value="SCH-DIRECT-LINK-03">定向链接创建 · 直播专场</option></select></label><label>定向链接自动化任务名称<span>*</span><input value={taskName} onChange={(event) => setTaskName(event.target.value)} /></label><label>商品（与商品ID二选一）<input value={form.product} onChange={(event) => setForm({ ...form, product: event.target.value })} placeholder="输入商品名称" /></label><label>定向商品ID（与商品二选一）<input value={form.productId} onChange={(event) => setForm({ ...form, productId: event.target.value })} placeholder="输入精选联盟商品ID" /></label><label>商品店铺<input value={form.store} onChange={(event) => setForm({ ...form, store: event.target.value })} placeholder="输入商品所属店铺" /></label><label>指定佣金系数（正常价格）<span>*</span><div className="commission-input"><input value={form.commission} onChange={(event) => setForm({ ...form, commission: event.target.value })} placeholder="例如：25" /><em>%</em></div></label><div className="creator-entry full"><div className="entry-tabs"><button className={entryMode === "ai" ? "active" : ""} onClick={() => setEntryMode("ai")}>AI整段解析</button><button className={entryMode === "paste" ? "active" : ""} onClick={() => setEntryMode("paste")}>批量粘贴 / 表格导入</button><button className={entryMode === "single" ? "active" : ""} onClick={() => setEntryMode("single")}>单个录入</button></div>{entryMode !== "single" ? <><textarea value={bulkText} onChange={(event) => setBulkText(event.target.value)} placeholder={entryMode === "ai" ? "例如：找小家电研究所、洁净生活家做创维循环扇定向链接，佣金25%。也可以无序输入一整段需求。" : "请填写达人UID，支持批量粘贴，请用英文逗号（,）隔开，每次最多支持100个"} /><div className="entry-actions"><button onClick={parseBulkText}>{entryMode === "ai" ? "AI解析信息" : "解析粘贴内容"}</button><button onClick={() => { setBulkText("小家电研究所，xiaojd_lab，dy_86541972\n洁净生活家，clean_life，dy_10376294"); setEntryMode("paste"); }}>⇧ 导入表格（演示）</button></div></> : <div className="single-creator"><label>达人UID<span>*</span><input value={form.uid} onChange={(event) => setForm({ ...form, uid: event.target.value })} placeholder="必填" /></label><label>达人昵称<input value={form.creator} onChange={(event) => setForm({ ...form, creator: event.target.value })} placeholder="选填" /></label><label>达人抖音ID<input value={form.douyinId} onChange={(event) => setForm({ ...form, douyinId: event.target.value })} placeholder="选填" /></label></div>}{parsedCreators.length > 0 && <div className="parsed-summary">已识别达人：<strong>{parsedCreators.length}</strong> 个 · 预计执行：<strong>1 次批量添加任务</strong></div>}</div><label className="full">特殊备注<textarea value={form.remark} onChange={(event) => setForm({ ...form, remark: event.target.value })} placeholder="可选，传递给影刀执行人员的特殊说明" /></label><div className="api-contract-note"><span>API</span><p>系统将调用固定影刀常规任务，按一次批量添加提交达人UID，并通过 task/newest/list 回查 Task UUID。</p></div></div><footer><button className="ghost-button" onClick={() => setCreateOpen(false)}>取消</button><button className="primary-button" onClick={submitTask}>创建并调用影刀</button></footer></section></div>}
+    {submitConfirmation && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSubmitConfirmation(null); }}><section className="link-submit-confirm" role="dialog" aria-modal="true" aria-labelledby="link-submit-confirm-title"><header><div><small>执行前确认</small><h2 id="link-submit-confirm-title">确认创建定向链接任务</h2><p>确认后将调用固定影刀 SOP，提交一次批量添加任务。</p></div><button onClick={() => setSubmitConfirmation(null)} aria-label="关闭">×</button></header><div className="link-submit-confirm-body"><div><small>商品</small><strong>{submitConfirmation.product}</strong></div><div><small>店铺</small><strong>{submitConfirmation.store}</strong></div><div><small>达人数量</small><strong>{submitConfirmation.count} 个</strong></div><div><small>预计执行</small><strong>1 次批量添加任务</strong></div></div><footer><button className="ghost-button" onClick={() => setSubmitConfirmation(null)}>取消</button><button className="primary-button" onClick={confirmSubmitTask}>确认创建并调用影刀</button></footer></section></div>}
     {detail && <div className="drawer-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDetailId(null); }}><aside className="link-detail-drawer" role="dialog" aria-modal="true" aria-label="影刀任务详情"><header><div><small>影刀任务详情</small><h2>{detail.id}</h2><p>影刀任务：{detail.yidaoId}</p></div><button onClick={() => setDetailId(null)} aria-label="关闭">×</button></header><div className="drawer-body"><div className={`link-result-hero ${detail.status === "异常" ? "failed" : detail.status === "执行中" ? "running" : "success"}`}><span>{detail.status === "执行中" ? "◌" : detail.status === "异常" ? "!" : "✓"}</span><div><strong>{detail.status}</strong><small>影刀API状态：{detail.api}</small></div></div><section className="detail-section"><h3>任务参数</h3><div className="task-detail-grid"><div><small>达人昵称</small><strong>{detail.creator}</strong></div><div><small>达人抖音ID</small><strong>{detail.douyinId}</strong></div><div><small>达人UID</small><strong>{detail.uid}</strong></div><div><small>指定佣金系数</small><strong>{detail.commission}</strong></div><div><small>商品</small><strong>{detail.product}</strong></div><div><small>商品店铺</small><strong>{detail.store}</strong></div><div><small>定向商品ID</small><strong>{detail.productId}</strong></div><div><small>特殊备注</small><strong>{detail.remark || "—"}</strong></div></div></section><section className="detail-section"><h3>影刀执行记录</h3><div className="yidao-log"><div><span>10:18:02</span><p><strong>请求已发送</strong> 内容罗盘向影刀定制API提交任务参数</p></div><div><span>10:18:04</span><p><strong>影刀已受理</strong> 返回影刀任务ID：{detail.yidaoId}</p></div><div><span>10:18:10</span><p><strong>状态同步</strong> 当前任务状态：{detail.status}</p></div></div></section></div><footer><button className="ghost-button" onClick={() => notify("已向影刀查询最新任务详情", "success")}>查询最新状态</button>{detail.status === "执行中" && <button className="stop-button" onClick={() => stopTask(detail.id)}>停止任务</button>}</footer></aside></div>}
   </>;
 }
@@ -2146,6 +2678,41 @@ function ApiRecords({ tasks, notify }: { tasks: Array<{ id: string; yidaoId: str
       return { button, handler };
     });
     return () => handlers.forEach(({ button, handler }) => button.removeEventListener("click", handler, true));
+  }, [tasks]);
+  useEffect(() => {
+    const table = document.querySelector<HTMLElement>(".api-record-table table");
+    const header = table?.querySelector("thead tr");
+    if (!table || !header) return;
+    const linkedHeader = Array.from(header.querySelectorAll("th")).find((cell) => cell.textContent === "关联内容罗盘任务");
+    if (linkedHeader) linkedHeader.textContent = "执行任务编号";
+    if (!header.querySelector("[data-business-api-columns]")) {
+      const marker = document.createElement("th");
+      marker.dataset.businessApiColumns = "true";
+      marker.textContent = "商品名称";
+      const count = document.createElement("th");
+      count.dataset.businessApiColumns = "true";
+      count.textContent = "达人数量";
+      const creator = document.createElement("th");
+      creator.dataset.businessApiColumns = "true";
+      creator.textContent = "创建人";
+      const action = header.lastElementChild;
+      action?.before(marker, count, creator);
+    }
+    table.querySelectorAll<HTMLTableRowElement>("tbody tr").forEach((row, index) => {
+      row.querySelectorAll("[data-business-api-cell]").forEach((cell) => cell.remove());
+      const task = tasks[index] as typeof tasks[number] & { product?: string; uid?: string; creator?: string };
+      if (!task) return;
+      const product = document.createElement("td");
+      product.dataset.businessApiCell = "true";
+      product.textContent = task.product ?? "—";
+      const count = document.createElement("td");
+      count.dataset.businessApiCell = "true";
+      count.textContent = `${task.uid?.split(",").filter(Boolean).length || 1} 个`;
+      const creator = document.createElement("td");
+      creator.dataset.businessApiCell = "true";
+      creator.textContent = task.creator && task.creator !== "未命名达人" ? task.creator : Number(task.id.slice(-2)) % 3 === 0 ? "林晓婷" : "陈旭光";
+      row.lastElementChild?.before(product, count, creator);
+    });
   }, [tasks]);
   return <><div className="api-records"><div className="api-record-note"><span>API</span><p>此处记录内容罗盘向影刀定制API发起的调用，以及影刀返回的响应状态。</p></div><div className="table-wrap api-record-table"><table><thead><tr><th>调用时间</th><th>请求编号</th><th>接口名称</th><th>关联内容罗盘任务</th><th>影刀任务ID</th><th>响应状态</th><th>耗时</th><th>操作</th></tr></thead><tbody>{tasks.map((task, index) => <tr key={task.id}><td>{task.created}</td><td><code>REQ-20260818-{String(index + 1128).padStart(5, "0")}</code></td><td><strong>createDirectedLinkTask</strong></td><td><button className="table-link" onClick={() => notify(`已定位任务 ${task.id}`)}>{task.id}</button></td><td><code>{task.yidaoId}</code></td><td><span className={`api-status ${task.api.includes("异常") ? "failed" : task.api === "已发送" ? "sending" : "success"}`}>{task.api}</span></td><td>{index % 2 ? "1.28s" : "0.86s"}</td><td><button className="row-action" onClick={() => setSelectedRecord({ task, index })}>查看报文</button></td></tr>)}</tbody></table></div></div>{selectedRecord && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedRecord(null); }}><section className="api-payload-modal" role="dialog" aria-modal="true" aria-label="API调用报文"><header><div><small>API 调用报文</small><h2>{requestId}</h2><p>createDirectedLinkTask · {selectedRecord.task.created}</p></div><button onClick={() => setSelectedRecord(null)} aria-label="关闭">×</button></header><div className="api-payload-body"><section><div><h3>请求参数</h3><button onClick={async () => { await navigator.clipboard.writeText(requestPayload); notify("请求报文已复制", "success"); }}>复制</button></div><pre>{requestPayload}</pre></section><section><div><h3>响应结果</h3><button onClick={async () => { await navigator.clipboard.writeText(responsePayload); notify("响应报文已复制", "success"); }}>复制</button></div><pre>{responsePayload}</pre></section></div><footer><button className="ghost-button" onClick={() => setSelectedRecord(null)}>关闭</button></footer></section></div>}</>;
 }
