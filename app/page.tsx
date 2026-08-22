@@ -592,7 +592,8 @@ function CreatorLibrary({ notify, onBack }: { notify: (message: string, tone?: N
     const currentStatus = getOutreachStage(creator);
     const hasActiveTask = processStages.includes(currentStatus as OutreachProcessStage);
     if (hasActiveTask) return { canAssign: false, hasActiveTask: true, currentStatus, reason: "当前达人已有进行中的建联任务，暂不可重复分配" };
-    if (currentStatus === "达成意向") return { canAssign: false, hasActiveTask: false, currentStatus, reason: "当前已达成合作意向，暂不支持再次分配" };
+    // 演示数据中的两条“已达成”样例用于展示结果后仍可再次分配：短视频列表的生活电器大玩家（c10）与竞品达人列表的阿阳测评（c5）。其它已达成样例保持原有置灰状态。
+    if (currentStatus === "达成意向" && !["c5", "c10"].includes(creator.id)) return { canAssign: false, hasActiveTask: false, currentStatus, reason: "当前已达成合作意向，暂不支持再次分配" };
     return { canAssign: true, hasActiveTask: false, currentStatus, reason: "当前无进行中的建联任务，可分配" };
   };
   const hasActiveOutreachTask = (creator: typeof creatorRows[number]) => getAssignmentEligibility(creator).hasActiveTask;
